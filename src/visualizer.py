@@ -23,8 +23,15 @@ class Visualizer:
         self.COLOR_CRITICAL = (0, 0, 255)  # Red
         self.COLOR_MODERATE = (0, 165, 255)  # Orange
         self.COLOR_MINOR = (255, 255, 0)  # Cyan
+        self.COLOR_BOTH_ARMS = (255, 255, 0)  # Cyan — butterfly both-arm highlight
+        self.COLOR_ENTRY_LINE = (255, 0, 255)  # Magenta — entry width
+        self.COLOR_UNDULATION_TRACE = (255, 255, 0)  # Cyan — undulation trail
         self.COLOR_TEXT_BG = (0, 0, 0)  # Black
         self.COLOR_TEXT = (255, 255, 255)  # White
+
+        # Undulation trace ring buffer (hip positions for last N frames)
+        self._undulation_trace = []
+        self._undulation_trace_maxlen = 30
 
     def create_annotated_video(
         self,
@@ -50,6 +57,11 @@ class Visualizer:
         """
         if not pose_data:
             raise ValueError("No pose data to visualize")
+
+        # Reset per-video state
+        self._undulation_trace = []
+        self._is_butterfly = ('undulation' in analysis_results.get('metrics', {}) and
+                              analysis_results['metrics']['undulation'].get('undulation_amplitude') is not None)
 
         # Build a fast lookup: frame_number -> pose
         pose_lookup = {fd['frame_number']: fd['pose'] for fd in pose_data}
@@ -106,11 +118,16 @@ class Visualizer:
         return output_path
 
     def _draw_pose(self, frame: np.ndarray, pose: Dict) -> np.ndarray:
-        """Draw pose skeleton on frame."""
+        """Draw pose skeleton on frame.
+
+        For butterfly, both arms are highlighted with a different colour to
+        emphasise simultaneous motion.  An entry-width line is drawn between
+        the two wrists when both are visible.
+        """
         if pose['raw_landmarks'] is None:
             return frame
 
-        # Draw landmarks and connections
+        # Always draw the full skeleton in green first
         self.mp_drawing.draw_landmarks(
             frame,
             pose['raw_landmarks'],
@@ -126,29 +143,121 @@ class Visualizer:
             )
         )
 
+        # --- Butterfly-specific overlays ---
+        if not self._is_butterfly:
+            return frame
+
+        landmarks = pose['landmarks']
+
+        # 1. Highlight both arms in cyan (thicker lines for both arm segments)
+        arm_segments = [
+            ('left_shoulder', 'left_elbow'),
+            ('left_elbow', 'left_wrist'),
+            ('right_shoulder', 'right_elbow'),
+            ('right_elbow', 'right_wrist'),
+        ]
+        for (src, dst) in arm_segments:
+            if (landmarks[src]['visibility'] > 0.5 and
+                landmarks[dst]['visibility'] > 0.5):
+                x1, y1 = int(landmarks[src]['x']), int(landmarks[src]['y'])
+                x2, y2 = int(landmarks[dst]['x']), int(landmarks[dst]['y'])
+                cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_BOTH_ARMS, 4)
+                # Small circle at joints
+                cv2.circle(frame, (x1, y1), 6, self.COLOR_BOTH_ARMS, -1)
+                cv2.circle(frame, (x2, y2), 6, self.COLOR_BOTH_ARMS, -1)
+
+        # 2. Entry-width line between wrists (magenta)
+        if (landmarks['left_wrist']['visibility'] > 0.5 and
+            landmarks['right_wrist']['visibility'] > 0.5):
+            lx = int(landmarks['left_wrist']['x'])
+            ly = int(landmarks['left_wrist']['y'])
+            rx = int(landmarks['right_wrist']['x'])
+            ry = int(landmarks['right_wrist']['y'])
+            cv2.line(frame, (lx, ly), (rx, ry), self.COLOR_ENTRY_LINE, 2)
+
+        # 3. Dolphin undulation trace — store average hip y per frame
+        if landmarks['left_hip']['visibility'] > 0.5 and landmarks['right_hip']['visibility'] > 0.5:
+            hip_y = (landmarks['left_hip']['y'] + landmarks['right_hip']['y']) / 2
+            hip_x = (landmarks['left_hip']['x'] + landmarks['right_hip']['x']) / 2
+            self._undulation_trace.append((int(hip_x), int(hip_y)))
+            # Keep ring buffer at max length
+            if len(self._undulation_trace) > self._undulation_trace_maxlen:
+                self._undulation_trace.pop(0)
+
+            # Draw the trace as a fading polyline
+            if len(self._undulation_trace) >= 2:
+                for i in range(1, len(self._undulation_trace)):
+                    alpha = i / len(self._undulation_trace)  # newer = brighter
+                    color = tuple(
+                        int(c * alpha) for c in self.COLOR_UNDULATION_TRACE
+                    )
+                    cv2.line(
+                        frame,
+                        self._undulation_trace[i - 1],
+                        self._undulation_trace[i],
+                        color,
+                        2
+                    )
+
         return frame
 
     def _draw_metrics_overlay(self, frame: np.ndarray, pose: Dict, analysis: Dict) -> np.ndarray:
-        """Draw real-time metrics overlay on frame."""
+        """Draw real-time metrics overlay on frame.
+
+        For butterfly: both elbow angles are shown, plus a sync indicator
+        between the two wrists.
+        """
         landmarks = pose['landmarks']
+        metrics = analysis['metrics']
+        is_bf = self._is_butterfly
 
-        # Draw elbow angle
-        if analysis['metrics'].get('elbow', {}).get('avg_angle') is not None:
+        # --- Elbow angles (left always, right too if butterfly) ---
+        if metrics.get('elbow', {}).get('avg_angle') is not None:
+
             # Left elbow
-            left_shoulder = landmarks['left_shoulder']
-            left_elbow = landmarks['left_elbow']
-            left_wrist = landmarks['left_wrist']
+            if (landmarks['left_shoulder']['visibility'] > 0.5 and
+                landmarks['left_elbow']['visibility'] > 0.5 and
+                landmarks['left_wrist']['visibility'] > 0.5):
 
-            if (left_shoulder['visibility'] > 0.5 and
-                left_elbow['visibility'] > 0.5 and
-                left_wrist['visibility'] > 0.5):
+                angle = self._calculate_angle(
+                    landmarks['left_shoulder'],
+                    landmarks['left_elbow'],
+                    landmarks['left_wrist']
+                )
+                pos = (int(landmarks['left_elbow']['x']), int(landmarks['left_elbow']['y']))
+                color = self._get_angle_color(angle, 80, 160, 120, reverse=False)
+                self._draw_angle_annotation(frame, pos, angle, color)
 
-                angle = self._calculate_angle(left_shoulder, left_elbow, left_wrist)
-                elbow_pos = (int(left_elbow['x']), int(left_elbow['y']))
+            # Right elbow (butterfly shows both; freestyle shows left only)
+            if is_bf and (landmarks['right_shoulder']['visibility'] > 0.5 and
+                landmarks['right_elbow']['visibility'] > 0.5 and
+                landmarks['right_wrist']['visibility'] > 0.5):
 
-                # Color based on angle quality
-                color = self._get_angle_color(angle, 80, 100, 120)
-                self._draw_angle_annotation(frame, elbow_pos, angle, color)
+                angle = self._calculate_angle(
+                    landmarks['right_shoulder'],
+                    landmarks['right_elbow'],
+                    landmarks['right_wrist']
+                )
+                pos = (int(landmarks['right_elbow']['x']), int(landmarks['right_elbow']['y']))
+                color = self._get_angle_color(angle, 80, 160, 120, reverse=False)
+                self._draw_angle_annotation(frame, pos, angle, color)
+
+        # --- Butterfly sync indicator (badge between wrists) ---
+        if is_bf and metrics.get('synchronization', {}).get('sync_delta') is not None:
+            if (landmarks['left_wrist']['visibility'] > 0.5 and
+                landmarks['right_wrist']['visibility'] > 0.5):
+
+                lx = landmarks['left_wrist']['x']
+                rx = landmarks['right_wrist']['x']
+                mid_x = int((lx + rx) / 2)
+                mid_y = int((landmarks['left_wrist']['y'] + landmarks['right_wrist']['y']) / 2)
+
+                sync_status = metrics['synchronization'].get('synchronized', False)
+                label = "SYNC" if sync_status else "ASYNC"
+                color = self.COLOR_SKELETON if sync_status else self.COLOR_CRITICAL
+
+                self._draw_text(frame, label, (mid_x - 20, mid_y - 10),
+                                scale=0.5, color=color, thickness=2)
 
         return frame
 
