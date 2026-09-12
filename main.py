@@ -13,6 +13,7 @@ from pathlib import Path
 from src.pose_detector import PoseDetector
 from src.video_processor import VideoProcessor
 from src.stroke_analyzer import StrokeAnalyzer
+from src.butterfly_analyzer import ButterflyAnalyzer
 from src.visualizer import Visualizer
 from src.feedback_generator import FeedbackGenerator
 
@@ -38,6 +39,13 @@ Examples:
     parser.add_argument(
         'video',
         help='Path to input video file'
+    )
+
+    parser.add_argument(
+        '--stroke',
+        choices=['freestyle', 'butterfly'],
+        default='freestyle',
+        help='Type of stroke to analyze (default: freestyle)'
     )
 
     parser.add_argument(
@@ -70,7 +78,7 @@ Examples:
         args.output = VideoProcessor.generate_output_path(args.video)
 
     print("=" * 60)
-    print("SWIM STROKE ANALYZER")
+    print(f"SWIM STROKE ANALYZER — {args.stroke.upper()}")
     print("=" * 60)
     print(f"Input video: {args.video}")
     if not args.report_only:
@@ -91,8 +99,14 @@ Examples:
         print("")
 
         # Step 2: Analyze stroke mechanics
-        print("Step 2/4: Analyzing stroke mechanics...")
-        analyzer = StrokeAnalyzer()
+        stroke_label = args.stroke.capitalize()
+        print(f"Step 2/4: Analyzing {stroke_label} stroke mechanics...")
+
+        if args.stroke == 'butterfly':
+            analyzer = ButterflyAnalyzer()
+        else:
+            analyzer = StrokeAnalyzer()
+
         analysis_results = analyzer.analyze_video(pose_data)
 
         if 'error' in analysis_results:
@@ -145,12 +159,12 @@ Examples:
             print("")
 
         print("=" * 60)
-        print("ANALYSIS COMPLETE")
+        print(f"{args.stroke.upper()} ANALYSIS COMPLETE")
         print("=" * 60)
 
         # Quick summary
         feedback = FeedbackGenerator()
-        summary = feedback.generate_summary(analysis_results)
+        summary = feedback.generate_summary(analysis_results, args.stroke)
         print(summary)
         print("")
 

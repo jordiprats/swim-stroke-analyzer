@@ -5,7 +5,8 @@ import numpy as np
 import mediapipe as mp
 from typing import List, Dict, Optional
 from src.video_processor import VideoProcessor
-from src.models.freestyle_rules import get_severity_emoji
+from src.models.freestyle_rules import get_severity_emoji as fs_get_severity_emoji
+from src.models.butterfly_rules import get_severity_emoji as bf_get_severity_emoji
 
 
 class Visualizer:
@@ -158,12 +159,12 @@ class Visualizer:
         current_frame: int,
         total_frames: int
     ) -> np.ndarray:
-        """Draw stats panel in corner of frame."""
+        """Draw stats panel in corner of frame (works for any stroke type)."""
         h, w = frame.shape[:2]
 
         # Semi-transparent overlay
         overlay = frame.copy()
-        panel_height = 200
+        panel_height = 240
         cv2.rectangle(overlay, (0, 0), (400, panel_height), self.COLOR_TEXT_BG, -1)
         frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
 
@@ -171,16 +172,21 @@ class Visualizer:
         y_offset = 30
         line_height = 25
 
-        # Title
-        self._draw_text(frame, "FREESTYLE ANALYSIS", (10, y_offset), scale=0.6, thickness=2)
+        # Title — detect stroke type from available metrics
+        metrics = analysis['metrics']
+        if 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None:
+            title = "BUTTERFLY ANALYSIS"
+        else:
+            title = "FREESTYLE ANALYSIS"
+
+        self._draw_text(frame, title, (10, y_offset), scale=0.6, thickness=2)
         y_offset += line_height + 5
 
-        # Metrics
-        metrics = analysis['metrics']
+        # --- Metrics (stroke-type agnostic: show whatever is available) ---
 
         if metrics.get('elbow', {}).get('avg_angle') is not None:
             elbow_avg = metrics['elbow']['avg_angle']
-            color = self._get_angle_color(elbow_avg, 80, 100, 120)
+            color = self._get_angle_color(elbow_avg, 80, 160, 120, reverse=False)
             self._draw_text(
                 frame,
                 f"Elbow Angle: {elbow_avg:.0f}deg",
@@ -190,6 +196,7 @@ class Visualizer:
             )
             y_offset += line_height
 
+        # Freestyle rotation
         if metrics.get('rotation', {}).get('avg_rotation') is not None:
             rotation_avg = metrics['rotation']['avg_rotation']
             color = self._get_angle_color(rotation_avg, 45, 60, 30, reverse=True)
@@ -199,6 +206,42 @@ class Visualizer:
                 (10, y_offset),
                 scale=0.5,
                 color=color
+            )
+            y_offset += line_height
+
+        # Butterfly undulation
+        if metrics.get('undulation', {}).get('undulation_amplitude') is not None:
+            amp = metrics['undulation']['undulation_amplitude']
+            self._draw_text(
+                frame,
+                f"Undulation: {amp:.3f}",
+                (10, y_offset),
+                scale=0.5
+            )
+            y_offset += line_height
+
+        # Butterfly arm synchronisation
+        if metrics.get('synchronization', {}).get('sync_delta') is not None:
+            delta = metrics['synchronization']['sync_delta']
+            sync_status = "SYNC" if metrics['synchronization'].get('synchronized') else "ASYNC"
+            color = self.COLOR_SKELETON if metrics['synchronization'].get('synchronized') else self.COLOR_CRITICAL
+            self._draw_text(
+                frame,
+                f"Arm Sync: {delta:.2f}s ({sync_status})",
+                (10, y_offset),
+                scale=0.5,
+                color=color
+            )
+            y_offset += line_height
+
+        # Butterfly arm entry width
+        if metrics.get('entry', {}).get('avg_entry_width') is not None:
+            ew = metrics['entry']['avg_entry_width']
+            self._draw_text(
+                frame,
+                f"Entry Width: {ew:.2f}x shoulder",
+                (10, y_offset),
+                scale=0.5
             )
             y_offset += line_height
 
