@@ -23,6 +23,8 @@ from src.stroke_analyzer import StrokeAnalyzer
 from src.butterfly_analyzer import ButterflyAnalyzer
 from src.video_processor import VideoProcessor
 from src.visualizer import Visualizer
+from src.data_exporter import export_datapoints_csv
+from src.pose_smoother import smooth_pose_data
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -180,12 +182,23 @@ def _process_video(video_id: str, input_path: str, output_path: str, report_path
         feedback_generator = FeedbackGenerator()
 
         poses = pose_detector.process_video(input_path)
+        _set_status(video_id, progress=35, message='Smoothing & interpolating pose data...')
+
+        # Post-process pose data: fill missing detections, filter implausible movements
+        smooth_pose_data(poses)
+
         _set_status(video_id, progress=50, message=f'Analyzing {stroke_label} mechanics...')
 
         analysis = analyzer.analyze_video(poses)
         _set_status(video_id, progress=65, message='Generating annotated video...')
 
         visualizer.create_annotated_video(poses, output_path, analysis, input_path)
+        _set_status(video_id, progress=75, message='Exporting per-frame datapoints...')
+
+        # Export per-frame datapoints as CSV for offline analysis
+        datapoints_path = os.path.join(RESULTS_FOLDER, f'{video_id}_datapoints.csv')
+        export_datapoints_csv(poses, datapoints_path, stroke_type)
+
         _set_status(video_id, progress=85, message='Re-encoding for browser...')
 
         # Best-effort ffmpeg re-encode; non-fatal if ffmpeg is absent
@@ -293,6 +306,14 @@ def get_result_video(video_id):
             return send_file(alt_path, mimetype=mimetype, as_attachment=False)
 
     return jsonify({'error': 'Video result not found'}), 404
+
+
+@app.route('/api/result/<video_id>/datapoints', methods=['GET'])
+def get_result_datapoints(video_id):
+    datapoints_path = os.path.join(RESULTS_FOLDER, f'{video_id}_datapoints.csv')
+    if not os.path.exists(datapoints_path):
+        return jsonify({'error': 'Datapoints not found'}), 404
+    return send_file(datapoints_path, mimetype='text/csv', as_attachment=False)
 
 
 @app.route('/api/result/<video_id>/report', methods=['GET'])

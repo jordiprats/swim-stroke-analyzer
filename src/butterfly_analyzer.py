@@ -380,44 +380,115 @@ class ButterflyAnalyzer:
 
     def _analyze_arm_synchronization(self, frames: List[Dict]) -> Dict:
         """
-        Measure synchronisation of left and right arm movements.
+        Measure synchronisation of left and right arm movements using joint angles.
 
-        In butterfly both arms should move together.  We detect the
-        timestamp of each wrist-x peak separately and measure the
-        average absolute delay between matching peaks.
+        In butterfly both arms should move together.  Instead of comparing
+        wrist-x peak timestamps (which is sensitive to camera angle), we
+        compare the **elbow angle** of each arm frame-by-frame.
+
+        Rationale: joint angles are measured relative to the body and are
+        much more robust to camera perspective than absolute x-coordinates.
+        In synchronized butterfly, at any given frame the left and right
+        elbow angles should be nearly equal.  If they consistently differ,
+        the arms are out of sync.
+
+        We also compute the **angle between the two arm vectors**
+        (shoulder → wrist) — this should be near 0 when both arms are
+        in the same phase and grows when they are offset.
         """
-        if len(frames) < 10:
+        if len(frames) < 5:
             return {'sync_delta': None, 'synchronized': None}
 
-        # Collect left-wrist samples
-        left_samples = []
-        right_samples = []
+        elbow_diffs = []
+        arm_angle_diffs = []
+
         for frame in frames:
             landmarks = frame['pose']['landmarks']
-            if landmarks['left_wrist']['visibility'] >= MIN_VISIBILITY:
-                left_samples.append((frame['timestamp'], landmarks['left_wrist']['x']))
-            if landmarks['right_wrist']['visibility'] >= MIN_VISIBILITY:
-                right_samples.append((frame['timestamp'], landmarks['right_wrist']['x']))
 
-        if len(left_samples) < 5 or len(right_samples) < 5:
+            # --- Elbow angle comparison ---
+            left_ok = all(
+                landmarks.get(s, {}).get('visibility', 0) >= MIN_VISIBILITY
+                for s in ('left_shoulder', 'left_elbow', 'left_wrist')
+            )
+            right_ok = all(
+                landmarks.get(s, {}).get('visibility', 0) >= MIN_VISIBILITY
+                for s in ('right_shoulder', 'right_elbow', 'right_wrist')
+            )
+
+            if left_ok and right_ok:
+                left_angle = self._calculate_angle(
+                    landmarks['left_shoulder'],
+                    landmarks['left_elbow'],
+                    landmarks['left_wrist']
+                )
+                right_angle = self._calculate_angle(
+                    landmarks['right_shoulder'],
+                    landmarks['right_elbow'],
+                    landmarks['right_wrist']
+                )
+                elbow_diffs.append(abs(left_angle - right_angle))
+
+            # --- Arm-vector angle (shoulder → wrist) relative to body axis ---
+            if all(
+                landmarks.get(s, {}).get('visibility', 0) >= MIN_VISIBILITY
+                for s in ('left_shoulder', 'right_shoulder',
+                          'left_hip', 'right_hip',
+                          'left_wrist', 'right_wrist')
+            ):
+                # Body axis (vertical): shoulder midpoint → hip midpoint
+                sx = (landmarks['left_shoulder']['x'] + landmarks['right_shoulder']['x']) / 2
+                sy = (landmarks['left_shoulder']['y'] + landmarks['right_shoulder']['y']) / 2
+                hx = (landmarks['left_hip']['x'] + landmarks['right_hip']['x']) / 2
+                hy = (landmarks['left_hip']['y'] + landmarks['right_hip']['y']) / 2
+                body_vec = np.array([hx - sx, hy - sy])  # downward in image
+
+                # Left arm vector (shoulder → wrist)
+                lv = np.array([
+                    landmarks['left_wrist']['x'] - landmarks['left_shoulder']['x'],
+                    landmarks['left_wrist']['y'] - landmarks['left_shoulder']['y'],
+                ])
+                # Right arm vector
+                rv = np.array([
+                    landmarks['right_wrist']['x'] - landmarks['right_shoulder']['x'],
+                    landmarks['right_wrist']['y'] - landmarks['right_shoulder']['y'],
+                ])
+
+                # Angle between left-arm vector and right-arm vector
+                norm_l = np.linalg.norm(lv)
+                norm_r = np.linalg.norm(rv)
+                if norm_l > 1e-6 and norm_r > 1e-6:
+                    cos_angle = np.dot(lv, rv) / (norm_l * norm_r)
+                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                    arm_angle = np.degrees(np.arccos(cos_angle))
+                    # In synchronized butterfly arms are parallel → angle near 0
+                    arm_angle_diffs.append(arm_angle)
+
+        if not elbow_diffs:
             return {'sync_delta': None, 'synchronized': None}
 
-        # Find peak timestamps for left wrist
-        left_peaks = self._find_peak_timestamps(left_samples)
-        right_peaks = self._find_peak_timestamps(right_samples)
+        avg_elbow_diff = float(np.mean(elbow_diffs))
+        avg_arm_angle = float(np.mean(arm_angle_diffs)) if arm_angle_diffs else None
 
-        if not left_peaks or not right_peaks:
-            return {'sync_delta': None, 'synchronized': None}
+        # Heuristic thresholds:
+        #   - avg elbow diff < 20°  → synchronized
+        #   - avg elbow diff 20-35° → marginal
+        #   - avg elbow diff > 35°  → out of sync
+        #
+        # The arm-vector angle (angle between left and right arm vectors) is
+        # more sensitive to stroke phase and camera perspective, so we use it
+        # only as a supporting indicator, not a hard gate.
+        sync_elbow = avg_elbow_diff <= 20.0
 
-        # Pair peaks by index and measure average absolute delta
-        min_len = min(len(left_peaks), len(right_peaks))
-        deltas = [abs(left_peaks[i] - right_peaks[i]) for i in range(min_len)]
-        avg_delta = np.mean(deltas)
+        # Overall sync: elbow-angle comparison is the primary signal.
+        # If avg_arm_angle is available and very large (>60°) it hints at
+        # asymmetry, but we don't gate on it.
+        synchronized = sync_elbow
 
         return {
-            'sync_delta': avg_delta,
-            'synchronized': avg_delta <= SYNC_MAX_DELTA,
-            'max_delta': max(deltas) if deltas else None,
+            'sync_delta': avg_elbow_diff,
+            'synchronized': synchronized,
+            'avg_elbow_diff': avg_elbow_diff,
+            'avg_arm_angle': avg_arm_angle,
         }
 
     @staticmethod
@@ -573,7 +644,7 @@ class ButterflyAnalyzer:
                 issues.append(ButterflyIssue(
                     'arms_not_synchronised',
                     ISSUE_TYPES['arms_not_synchronised']['severity'],
-                    f"Arms not synchronised (avg delay {delta:.2f}s — should be < {SYNC_MAX_DELTA}s)",
+                    f"Arms not synchronised (avg elbow-angle diff {delta:.1f}° — should be < 20°)",
                     ISSUE_TYPES['arms_not_synchronised']['tip'],
                     delta
                 ))
