@@ -348,10 +348,6 @@ Focus on these in order:
 - [ ] Save your results (currently in-memory only)
 - [ ] Track progress over time
 
-**Done:**
-- [x] Butterfly stroke analysis (CLI + backend)
-- [x] Butterfly-specific skeleton overlays (both-arm highlight, entry width, undulation trace, sync indicator)
-
 **Eventually:**
 - [ ] Underwater footage support
 - [ ] Multiple camera angles
