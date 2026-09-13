@@ -263,10 +263,19 @@ def _fix_implausible_proximities(pose_data: List[Dict]):
             dist = _euclidean(a, b)
             if dist < MIN_LANDMARK_SEPARATION:
                 # One of them is likely a hallucination — drop visibility on the
-                # one with lower confidence, or the distal one (wrist > shoulder)
-                # The wrist/ankle are more likely to be wrong.
-                # Reduce visibility to 0 so it gets re-interpolated later.
-                a['visibility'] = 0.0
+                # one with lower confidence, or the more distal one.
+                # Distal landmarks (wrist, ankle) are more likely to be wrong.
+                distal_weight = {'wrist': 2, 'ankle': 2, 'elbow': 1, 'knee': 1,
+                                 'shoulder': 0, 'hip': 0}
+                a_distal = max(distal_weight.get(a_name.split('_')[-1], 0), 0)
+                b_distal = max(distal_weight.get(b_name.split('_')[-1], 0), 0)
+                a_vis = a.get('visibility', 0)
+                b_vis = b.get('visibility', 0)
+                # Zero the one that is less confident OR more distal
+                if a_distal > b_distal or (a_distal == b_distal and a_vis <= b_vis):
+                    a['visibility'] = 0.0
+                else:
+                    b['visibility'] = 0.0
 
 
 # ── Step 3: Kinematic filter ──
@@ -310,11 +319,16 @@ def _apply_kinematic_filter(pose_data: List[Dict]):
                 curr_lm['visibility'] = 0.0
 
         # Also check angle changes for elbow and knee
+        # Map joint name to the three landmark names (proximal, joint, distal)
+        joint_landmark_map = {
+            'elbow': ('shoulder', 'elbow', 'wrist'),
+            'knee': ('hip', 'knee', 'ankle'),
+        }
         for side in ('left', 'right'):
-            for joint in ('elbow',):
-                p1 = f'{side}_shoulder'
-                p2 = f'{side}_{joint}'
-                p3 = f'{side}_wrist'
+            for joint, (prox, jnt, dist) in joint_landmark_map.items():
+                p1 = f'{side}_{prox}'
+                p2 = f'{side}_{jnt}'
+                p3 = f'{side}_{dist}'
                 if p1 in curr_landmarks and p2 in curr_landmarks and p3 in curr_landmarks:
                     curr_angle = _calculate_angle(curr_landmarks[p1], curr_landmarks[p2], curr_landmarks[p3])
                     prev_angle = _calculate_angle(
@@ -404,9 +418,7 @@ def _calculate_angle(p1: Dict, p2: Dict, p3: Dict) -> Optional[float]:
     c = np.array([p3['x'], p3['y']])
     v1 = a - b
     v2 = c - b
-    norm = np.linalg.norm(v1) * np.linalg.norm(v2)
-    if norm < 1e-6:
-        return None
+    norm = np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6
     cos = np.dot(v1, v2) / norm
     cos = np.clip(cos, -1.0, 1.0)
     return float(np.degrees(np.arccos(cos)))

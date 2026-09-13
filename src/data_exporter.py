@@ -48,7 +48,6 @@ def _calculate_angle(p1: Dict, p2: Dict, p3: Dict) -> Optional[float]:
 def export_datapoints_csv(
     pose_data: List[Dict],
     output_path: str,
-    analysis_type: str = 'freestyle',
 ) -> str:
     """
     Export per-frame datapoints to a CSV file.
@@ -56,7 +55,6 @@ def export_datapoints_csv(
     Args:
         pose_data: List of frame dicts (from PoseDetector.process_video)
         output_path: Where to save the CSV file
-        analysis_type: 'freestyle' or 'butterfly' (affects column naming)
 
     Returns:
         The output_path that was written to.

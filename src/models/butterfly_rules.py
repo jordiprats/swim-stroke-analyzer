@@ -46,6 +46,36 @@ KNEE_ANGLE_EXCESSIVE_BEND = 110     # Below this → too much knee, not enough h
 # Measured as the absolute difference in wrist-x peak timestamps (in seconds).
 SYNC_MAX_DELTA = 0.15               # Max allowed delay between left & right peaks
 
+# --- Arm Recovery ---
+# Recovery height measured as (elbow_y - shoulder_y) / frame_height
+# In butterfly the arms sweep low and wide; a high recovery wastes energy.
+RECOVERY_HEIGHT_MIN = 0.05          # 5% of frame height – minimum clearance
+RECOVERY_HEIGHT_MAX = 0.20          # 20% – maximum before energy waste
+RECOVERY_HEIGHT_EXCESSIVE = 0.25    # Above this → arms too high, taxing recovery
+
+# --- Shoulder-Hip Phase Relationship ---
+# Proper undulation means shoulder and hip move out of phase.
+# Measured as cross-correlation lag between shoulder y and hip y.
+PHASE_LAG_IDEAL = 0.25              # Ideal lag as fraction of stroke cycle
+PHASE_LAG_MIN = 0.15                # Minimum acceptable lag
+PHASE_LAG_MAX = 0.35                # Maximum acceptable lag
+PHASE_LAG_TOO_SMALL = 0.10          # Below → shoulders and hips move together (no wave)
+
+# --- Stroke Phase Timing (Coordination Index) ---
+# The second kick should align with the end of the pull (wrist passes hip).
+# Measured as frame gap between wrist-passes-hip and ankle-max-extension.
+COORDINATION_MAX_GAP = 2            # Max frames between pull-end and kick-peak
+
+# --- Late Breathing ---
+# Head should descend before hands enter.  Measured as frame gap between
+# max nose-y (breath peak) and hand-entry frame.
+LATE_BREATHING_MAX_GAP = 3          # Max frames between breath peak and hand entry
+
+# --- Hip Drop During Breath ---
+# Hip y at breathing frame relative to average hip y.
+HIP_DROP_MAX = 0.03                 # 3% of frame height – max hip drop during breath
+HIP_DROP_EXCESSIVE = 0.06           # Above → hips sink too much when breathing
+
 # --- Visibility ---
 MIN_VISIBILITY = 0.5
 
@@ -123,6 +153,31 @@ ISSUE_TYPES = {
     'knee_too_straight': {
         'name': 'Knees Too Straight — Not Enough Kick',
         'tip': 'Allow a natural bend in your knees during the downbeat (~120–150°). A straight leg doesn\'t create enough propulsion.',
+        'severity': SEVERITY_MODERATE,
+    },
+    'recovery_too_high': {
+        'name': 'Arm Recovery Too High',
+        'tip': 'Keep your arms low and sweeping just above the water surface. High arm recovery wastes energy and causes shoulder strain. Imagine skimming the water with your fingertips.',
+        'severity': SEVERITY_MODERATE,
+    },
+    'shoulder_hip_in_phase': {
+        'name': 'Shoulders and Hips Moving Together (No Wave)',
+        'tip': 'Initiate the dolphin wave from your chest, letting your hips rise as your chest presses down. Your shoulders and hips should move out of phase — when shoulders go down, hips go up.',
+        'severity': SEVERITY_CRITICAL,
+    },
+    'poor_coordination': {
+        'name': 'Kick and Pull Not Aligned',
+        'tip': 'Time your second kick to finish exactly when your hands finish the pull past your hips. The down-kick should accelerate as your palms push back. Practice with a 3-3-3 drill to rebuild timing.',
+        'severity': SEVERITY_CRITICAL,
+    },
+    'late_breathing': {
+        'name': 'Late Breathing — Head Still High When Hands Enter',
+        'tip': 'Snap your head back down into the water BEFORE your hands enter. If your head is still up at hand entry, your hips will drop and create drag. Practice head-down dolphin kicks to retrain the timing.',
+        'severity': SEVERITY_MODERATE,
+    },
+    'hips_drop_during_breath': {
+        'name': 'Hips Drop Too Low During Breath',
+        'tip': 'Keep your hips high and close to the surface when you breathe. If your hips sink when you lift your head, you\'re creating a seesaw effect that kills momentum. Focus on pressing your chest down to keep hips up.',
         'severity': SEVERITY_MODERATE,
     },
 }

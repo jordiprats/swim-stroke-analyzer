@@ -197,7 +197,7 @@ def _process_video(video_id: str, input_path: str, output_path: str, report_path
 
         # Export per-frame datapoints as CSV for offline analysis
         datapoints_path = os.path.join(RESULTS_FOLDER, f'{video_id}_datapoints.csv')
-        export_datapoints_csv(poses, datapoints_path, stroke_type)
+        export_datapoints_csv(poses, datapoints_path)
 
         _set_status(video_id, progress=85, message='Re-encoding for browser...')
 

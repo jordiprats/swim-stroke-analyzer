@@ -11,6 +11,7 @@ from src.models.freestyle_rules import (
 )
 from src.models.butterfly_rules import (
     ButterflyIssue,
+    HIP_DROP_MAX,
     get_severity_emoji as bf_get_severity_emoji,
     get_severity_label as bf_get_severity_label,
 )
@@ -63,7 +64,7 @@ class FeedbackGenerator:
         # ====== QUICK INSIGHT (THE HOOK) ======
         insight = self._generate_quick_insight(rating, critical_issues, moderate_issues, is_butterfly)
         report.append("\u2500" * 36)
-        report.append("\U0001f4c9 QUICK INSIGHT")
+        report.append("\U0001f4ca QUICK INSIGHT")
         report.append("\u2500" * 36)
         report.append(insight)
         report.append("")
@@ -244,7 +245,7 @@ class FeedbackGenerator:
             # --- Butterfly strengths ---
             if metrics.get('elbow', {}).get('avg_angle'):
                 angle = metrics['elbow']['avg_angle']
-                if 120 <= angle <= 150:
+                if 120 <= angle <= 160:
                     strengths.append("Good elbow bend during pull — maintaining leverage!")
 
             if metrics.get('undulation', {}).get('undulation_amplitude'):
@@ -254,6 +255,25 @@ class FeedbackGenerator:
 
             if metrics.get('synchronization', {}).get('synchronized') is True:
                 strengths.append("Arms are well synchronised — both hands entering together!")
+
+            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+                rec = metrics['recovery']['avg_recovery_height']
+                if rec is not None and rec <= 0.20:
+                    strengths.append("Low arm recovery — efficient sweeping motion!")
+
+            if metrics.get('shoulder_hip_phase', {}).get('in_phase') is False:
+                strengths.append("Good body wave — shoulders and hips moving out of phase!")
+
+            if metrics.get('hip_during_breath', {}).get('hip_drop') is not None:
+                hip_drop = metrics['hip_during_breath']['hip_drop']
+                if hip_drop is not None and hip_drop <= HIP_DROP_MAX:
+                    strengths.append("Hips stay high during breath — great body line!")
+
+            if metrics.get('coordination', {}).get('aligned') is True:
+                strengths.append("Kick and pull well timed — good two-kick rhythm!")
+
+            if metrics.get('breathing_timing', {}).get('late_breathing') is False:
+                strengths.append("Breathing timing is good — head down before hands enter!")
 
             if metrics.get('head', {}).get('breathing_lift'):
                 lift = metrics['head']['breathing_lift']
@@ -313,7 +333,7 @@ class FeedbackGenerator:
             if metrics.get('entry', {}).get('avg_entry_width') is not None:
                 entry = metrics['entry']
                 lines.append(f"\U0001f7b8 Arm Entry Width:")
-                lines.append(f"   Avg wrist span: {entry['avg_entry_width']:.2f}x shoulder width")
+                lines.append(f"   Avg wrist span: {entry['avg_entry_width']:.2f}x frame width")
                 lines.append("")
 
             if metrics.get('undulation', {}).get('undulation_amplitude') is not None:
@@ -327,7 +347,45 @@ class FeedbackGenerator:
                 sync = metrics['synchronization']
                 status = "Synchronised" if sync['synchronized'] else "Not synchronised"
                 lines.append(f"\U0001f7b8 Arm Synchronisation:")
-                lines.append(f"   Avg delay: {sync['sync_delta']:.2f}s ({status})")
+                lines.append(f"   Avg elbow diff: {sync['sync_delta']:.1f}° ({status})")
+                lines.append("")
+
+            # --- New butterfly metrics ---
+            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+                rec = metrics['recovery']
+                lines.append(f"\U0001f7b8 Arm Recovery Height:")
+                lines.append(f"   Avg clearance: {rec['avg_recovery_height']:.2f} of frame height (optimal < 0.20)")
+                lines.append(f"   Max clearance: {rec['max_recovery_height']:.2f}")
+                lines.append("")
+
+            if metrics.get('shoulder_hip_phase', {}).get('phase_lag') is not None:
+                phase = metrics['shoulder_hip_phase']
+                status = "Out of phase" if not phase['in_phase'] else "In phase (no wave)"
+                lines.append(f"\U0001f7b8 Shoulder-Hip Phase:")
+                lines.append(f"   Phase lag: {phase['phase_lag']:.2f} of stroke cycle ({status})")
+                lines.append(f"   Correlation: {phase['cross_correlation']:.2f}")
+                lines.append("")
+
+            if metrics.get('hip_during_breath', {}).get('hip_drop') is not None:
+                hd = metrics['hip_during_breath']
+                lines.append(f"\U0001f7b8 Hip Position During Breath:")
+                lines.append(f"   Hip drop: {hd['hip_drop']:.3f} of frame height (optimal < 0.03)")
+                lines.append(f"   Breaths detected: {hd['num_breaths_detected']}")
+                lines.append("")
+
+            if metrics.get('coordination', {}).get('coordination_gap') is not None:
+                coord = metrics['coordination']
+                status = "Aligned" if coord['aligned'] else "Misaligned"
+                lines.append(f"\U0001f7b8 Kick-Pull Coordination:")
+                lines.append(f"   Avg gap: {coord['coordination_gap']:.1f} frames ({status})")
+                lines.append(f"   Pull events: {coord['num_pull_events']} | Kick events: {coord['num_kick_events']}")
+                lines.append("")
+
+            if metrics.get('breathing_timing', {}).get('breath_to_entry_gap') is not None:
+                bt = metrics['breathing_timing']
+                status = "On time" if not bt['late_breathing'] else "Late (head still up)"
+                lines.append(f"\U0001f7b8 Breathing Timing:")
+                lines.append(f"   Breath-to-entry gap: {bt['breath_to_entry_gap']:.1f} frames ({status})")
                 lines.append("")
         else:
             # Freestyle-specific metrics

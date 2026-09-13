@@ -12,6 +12,11 @@ from src.models.butterfly_rules import (
     KNEE_ANGLE_OPTIMAL_MIN, KNEE_ANGLE_OPTIMAL_MAX,
     KNEE_ANGLE_TOO_STRAIGHT, KNEE_ANGLE_EXCESSIVE_BEND,
     SYNC_MAX_DELTA,
+    RECOVERY_HEIGHT_MIN, RECOVERY_HEIGHT_MAX, RECOVERY_HEIGHT_EXCESSIVE,
+    PHASE_LAG_IDEAL, PHASE_LAG_MIN, PHASE_LAG_MAX, PHASE_LAG_TOO_SMALL,
+    COORDINATION_MAX_GAP,
+    LATE_BREATHING_MAX_GAP,
+    HIP_DROP_MAX, HIP_DROP_EXCESSIVE,
     MIN_VISIBILITY, ButterflyIssue, ISSUE_TYPES,
     SEVERITY_CRITICAL, SEVERITY_MODERATE, SEVERITY_MINOR,
 )
@@ -49,14 +54,24 @@ class ButterflyAnalyzer:
 
         print(f"Valid frames: {len(valid_frames)}/{len(pose_data)}")
 
+        # Filter to active swimming frames (exclude preparation/waiting)
+        active_frames = self._filter_active_swimming_frames(valid_frames)
+        if len(active_frames) < len(valid_frames):
+            print(f"Active swimming frames: {len(active_frames)}/{len(valid_frames)}")
+
         # Analyze different aspects
-        elbow_metrics = self._analyze_elbow_angles(valid_frames)
-        entry_metrics = self._analyze_arm_entry_width(valid_frames)
-        undulation_metrics = self._analyze_body_undulation(valid_frames)
-        head_metrics = self._analyze_head_position(valid_frames)
-        stroke_rate_metrics = self._analyze_stroke_rate(valid_frames)
-        kick_metrics = self._analyze_kick(valid_frames)
-        sync_metrics = self._analyze_arm_synchronization(valid_frames)
+        elbow_metrics = self._analyze_elbow_angles(active_frames)
+        entry_metrics = self._analyze_arm_entry_width(active_frames)
+        undulation_metrics = self._analyze_body_undulation(active_frames)
+        head_metrics = self._analyze_head_position(active_frames)
+        stroke_rate_metrics = self._analyze_stroke_rate(active_frames)
+        kick_metrics = self._analyze_kick(active_frames)
+        sync_metrics = self._analyze_arm_synchronization(active_frames)
+        recovery_metrics = self._analyze_arm_recovery(active_frames)
+        phase_metrics = self._analyze_shoulder_hip_phase(active_frames)
+        hip_breath_metrics = self._analyze_hip_during_breath(active_frames, head_metrics)
+        timing_metrics = self._analyze_stroke_phase_timing(active_frames)
+        breath_timing_metrics = self._analyze_breathing_timing(active_frames)
 
         # Combine all metrics
         self.metrics = {
@@ -67,6 +82,11 @@ class ButterflyAnalyzer:
             'stroke_rate': stroke_rate_metrics,
             'kick': kick_metrics,
             'synchronization': sync_metrics,
+            'recovery': recovery_metrics,
+            'shoulder_hip_phase': phase_metrics,
+            'hip_during_breath': hip_breath_metrics,
+            'coordination': timing_metrics,
+            'breathing_timing': breath_timing_metrics,
             'valid_frame_ratio': len(valid_frames) / len(pose_data)
         }
 
@@ -87,7 +107,7 @@ class ButterflyAnalyzer:
         left_elbow_angles = []
         right_elbow_angles = []
         ELBOW_MIN = 20.0
-        ELBOW_MAX = 160.0
+        ELBOW_MAX = 180.0
 
         for frame in frames:
             landmarks = frame['pose']['landmarks']
@@ -132,37 +152,56 @@ class ButterflyAnalyzer:
 
     def _analyze_arm_entry_width(self, frames: List[Dict]) -> Dict:
         """
-        Analyze arm entry width relative to shoulder width.
+        Analyze arm entry width relative to frame width.
 
         In butterfly both arms enter simultaneously.  We measure the distance
-        between the two wrists as a fraction of shoulder width — too narrow
+        between the two wrists as a fraction of frame width — too narrow
         reduces pull length, too wide loses leverage.
 
-        Filters out outlier ratios (> 6.0) caused by pose-estimation glitches
-        where the model places one wrist far from the body.
+        Only measures at hand-entry frames (wrist y at local maximum = hands
+        at lowest point in frame, just before recovery begins).
+        Filters out outlier ratios (> 6.0) caused by pose-estimation glitches.
         """
-        entry_widths = []
         MAX_SANE_RATIO = 6.0
+        frame_width = frames[0]['pose']['frame_shape'][1]
 
+        # Find hand-entry frames: wrist y local maxima (hands at lowest point)
+        wrist_y = []
         for frame in frames:
             landmarks = frame['pose']['landmarks']
+            lw = landmarks['left_wrist']
+            rw = landmarks['right_wrist']
+            if lw['visibility'] >= MIN_VISIBILITY and rw['visibility'] >= MIN_VISIBILITY:
+                wrist_y.append((lw['y'] + rw['y']) / 2)
+            else:
+                wrist_y.append(None)
 
-            # Need both wrists and both shoulders visible
+        entry_indices = set()
+        MIN_ENTRY_GAP = 15
+        last_entry = -999
+        for i in range(1, len(wrist_y) - 1):
+            if wrist_y[i] is not None and wrist_y[i - 1] is not None and wrist_y[i + 1] is not None:
+                if wrist_y[i] > wrist_y[i - 1] and wrist_y[i] > wrist_y[i + 1]:
+                    if i - last_entry >= MIN_ENTRY_GAP:
+                        entry_indices.add(i)
+                        last_entry = i
+
+        entry_widths = []
+        for i, frame in enumerate(frames):
+            if i not in entry_indices:
+                continue
+            landmarks = frame['pose']['landmarks']
+
+            # Need both wrists visible
             if (landmarks['left_wrist']['visibility'] < MIN_VISIBILITY or
-                landmarks['right_wrist']['visibility'] < MIN_VISIBILITY or
-                landmarks['left_shoulder']['visibility'] < MIN_VISIBILITY or
-                landmarks['right_shoulder']['visibility'] < MIN_VISIBILITY):
+                landmarks['right_wrist']['visibility'] < MIN_VISIBILITY):
                 continue
 
             # Wrist span (entry width)
             wrist_span = abs(landmarks['left_wrist']['x'] - landmarks['right_wrist']['x'])
-            shoulder_span = abs(landmarks['left_shoulder']['x'] - landmarks['right_shoulder']['x'])
 
-            if shoulder_span < 1:
-                continue
-
-            # Ratio: 1.0 means wrist span = shoulder span
-            ratio = wrist_span / shoulder_span
+            # Ratio relative to frame width
+            ratio = wrist_span / frame_width
             if ratio <= MAX_SANE_RATIO:
                 entry_widths.append(ratio)
 
@@ -384,11 +423,19 @@ class ButterflyAnalyzer:
                 right_knee_angles.append(angle)
                 knee_angles.append(angle)
 
+        # Filter out impossible knee angles (< 100° = leg can't bend that far,
+        # > 170° = hyperextension glitch)
+        KNEE_MIN = 100.0
+        KNEE_MAX = 170.0
+        knee_angles_filtered = [a for a in knee_angles if KNEE_MIN <= a <= KNEE_MAX]
+        left_filtered = [a for a in left_knee_angles if KNEE_MIN <= a <= KNEE_MAX]
+        right_filtered = [a for a in right_knee_angles if KNEE_MIN <= a <= KNEE_MAX]
+
         return {
-            'avg_knee_angle': np.mean(knee_angles) if knee_angles else None,
-            'min_knee_angle': np.min(knee_angles) if knee_angles else None,
-            'left_avg': np.mean(left_knee_angles) if left_knee_angles else None,
-            'right_avg': np.mean(right_knee_angles) if right_knee_angles else None,
+            'avg_knee_angle': np.mean(knee_angles_filtered) if knee_angles_filtered else None,
+            'min_knee_angle': np.min(knee_angles_filtered) if knee_angles_filtered else None,
+            'left_avg': np.mean(left_filtered) if left_filtered else None,
+            'right_avg': np.mean(right_filtered) if right_filtered else None,
         }
 
     def _analyze_arm_synchronization(self, frames: List[Dict]) -> Dict:
@@ -418,7 +465,7 @@ class ButterflyAnalyzer:
         """
         SYNC_WINDOW = 30
         ELBOW_MIN = 20.0
-        ELBOW_MAX = 160.0
+        ELBOW_MAX = 180.0
         STRICT_VIS = 0.7
 
         if len(frames) < 5:
@@ -534,6 +581,404 @@ class ButterflyAnalyzer:
             'avg_arm_angle': avg_arm_angle,
         }
 
+    def _analyze_arm_recovery(self, frames: List[Dict]) -> Dict:
+        """
+        Analyze arm recovery height and clearance.
+
+        In butterfly the arms should sweep low and wide just above the
+        water surface.  We track the vertical (y) position of the elbow
+        and wrist relative to the shoulder during recovery — when the
+        wrist y is above (lower in 2D) the shoulder y, the arm is in
+        recovery phase.
+
+        Recovery clearance = (elbow_y - shoulder_y) / frame_height.
+        High clearance (> 0.25) indicates wasted energy.
+        """
+        if len(frames) < 3:
+            return {'avg_recovery_height': None, 'max_recovery_height': None}
+
+        frame_height = frames[0]['pose']['frame_shape'][0]
+        left_clearances = []
+        right_clearances = []
+
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+
+            # --- Left arm recovery clearance ---
+            if (landmarks['left_shoulder']['visibility'] >= MIN_VISIBILITY and
+                landmarks['left_elbow']['visibility'] >= MIN_VISIBILITY):
+                # Recovery phase: elbow above shoulder (y smaller = higher in frame)
+                # Clearance = how far elbow is above shoulder
+                clearance = (landmarks['left_elbow']['y'] - landmarks['left_shoulder']['y']) / frame_height
+                left_clearances.append(clearance)
+
+            # --- Right arm ---
+            if (landmarks['right_shoulder']['visibility'] >= MIN_VISIBILITY and
+                landmarks['right_elbow']['visibility'] >= MIN_VISIBILITY):
+                clearance = (landmarks['right_elbow']['y'] - landmarks['right_shoulder']['y']) / frame_height
+                right_clearances.append(clearance)
+
+        all_clearances = left_clearances + right_clearances
+
+        if not all_clearances:
+            return {'avg_recovery_height': None, 'max_recovery_height': None}
+
+        # Recovery clearance can be negative (elbow below shoulder = pull phase)
+        # We only care about positive clearance (recovery above shoulder)
+        positive = [c for c in all_clearances if c > 0]
+
+        return {
+            'avg_recovery_height': np.mean(positive) if positive else None,
+            'max_recovery_height': np.max(positive) if positive else None,
+            'left_avg': np.mean(left_clearances) if left_clearances else None,
+            'right_avg': np.mean(right_clearances) if right_clearances else None,
+        }
+
+    def _analyze_shoulder_hip_phase(self, frames: List[Dict]) -> Dict:
+        """
+        Analyze shoulder-hip phase relationship (the wave).
+
+        In proper butterfly undulation, the shoulders and hips should move
+        out of phase — when the shoulders press down, the hips should drive
+        up.  We measure the cross-correlation lag between shoulder y and
+        hip y time series.
+
+        A lag of ~0.25 of the stroke cycle is ideal.  If lag is near 0,
+        shoulders and hips are moving together (no wave).
+        """
+        if len(frames) < 10:
+            return {'phase_lag': None, 'in_phase': None}
+
+        frame_height = frames[0]['pose']['frame_shape'][0]
+
+        shoulder_y = []
+        hip_y = []
+
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+            ls = landmarks['left_shoulder']
+            rs = landmarks['right_shoulder']
+            lh = landmarks['left_hip']
+            rh = landmarks['right_hip']
+
+            if (ls['visibility'] >= MIN_VISIBILITY and rs['visibility'] >= MIN_VISIBILITY):
+                avg_sy = (ls['y'] + rs['y']) / 2 / frame_height
+                shoulder_y.append(avg_sy)
+
+            if (lh['visibility'] >= MIN_VISIBILITY and rh['visibility'] >= MIN_VISIBILITY):
+                avg_hy = (lh['y'] + rh['y']) / 2 / frame_height
+                hip_y.append(avg_hy)
+
+        # Ensure same length
+        min_len = min(len(shoulder_y), len(hip_y))
+        if min_len < 10:
+            return {'phase_lag': None, 'in_phase': None}
+
+        shoulder_y = shoulder_y[:min_len]
+        hip_y = hip_y[:min_len]
+
+        # Detrend (subtract mean)
+        s_detrend = [v - np.mean(shoulder_y) for v in shoulder_y]
+        h_detrend = [v - np.mean(hip_y) for v in hip_y]
+
+        # Cross-correlation
+        # We want the lag (in frames) that maximises correlation
+        max_lag = min(30, min_len // 2)
+        best_lag = 0
+        best_corr = -1
+        for lag in range(-max_lag, max_lag + 1):
+            shifted = s_detrend[max(0, lag):min(min_len, min_len + lag)]
+            target = h_detrend[max(0, -lag):min(min_len, min_len - lag)]
+            if len(shifted) < 5:
+                continue
+            corr = np.corrcoef(shifted, target)[0, 1]
+            if abs(corr) > abs(best_corr):
+                best_corr = corr
+                best_lag = lag
+
+        # Normalise lag to fraction of stroke cycle.
+        # Estimate stroke cycle length from hip signal zero-crossings.
+        crossings = 0
+        for i in range(1, len(h_detrend)):
+            if (h_detrend[i - 1] < 0 and h_detrend[i] >= 0) or \
+               (h_detrend[i - 1] > 0 and h_detrend[i] <= 0):
+                crossings += 1
+        cycle_len = max(1, (min_len / max(1, crossings)) if crossings > 0 else min_len)
+        norm_lag = abs(best_lag) / cycle_len
+
+        # Negative correlation means out-of-phase (ideal for butterfly)
+        # Positive correlation means in-phase (no wave)
+        in_phase = best_corr > 0
+
+        return {
+            'phase_lag': norm_lag,
+            'in_phase': in_phase,
+            'cross_correlation': best_corr,
+            'estimated_cycle_frames': cycle_len,
+        }
+
+    def _analyze_hip_during_breath(self, frames: List[Dict], head_metrics: Dict) -> Dict:
+        """
+        Analyze hip position at the moment of breathing.
+
+        At the frame where the nose reaches its highest y (peak breath),
+        we check the hip y position.  If the hips drop significantly
+        relative to their average position, it indicates poor body line
+        during breathing.
+        """
+        if len(frames) < 5:
+            return {'hip_drop': None, 'hip_drop_during_breath': None}
+
+        frame_height = frames[0]['pose']['frame_shape'][0]
+
+        # Find breathing frames: nose y local maxima
+        nose_y = []
+        hip_y = []
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+            if landmarks['nose']['visibility'] >= MIN_VISIBILITY:
+                nose_y.append(landmarks['nose']['y'])
+            else:
+                nose_y.append(None)
+
+            lh = landmarks['left_hip']
+            rh = landmarks['right_hip']
+            if (lh['visibility'] >= MIN_VISIBILITY and rh['visibility'] >= MIN_VISIBILITY):
+                hip_y.append((lh['y'] + rh['y']) / 2)
+            else:
+                hip_y.append(None)
+
+        # Find local minima in nose_y (breath peaks: nose goes higher = smaller y)
+        # Requirements:
+        #   - minimum gap of MIN_BREATH_GAP frames between breaths
+        #   - nose_y change >= MIN_BREATH_AMPLITUDE pixels (to filter noise)
+        MIN_BREATH_GAP = 15        # ~0.5s between breaths
+        MIN_BREATH_AMPLITUDE = 30  # pixels — nose must rise at least this much
+        breath_frames = []
+        last_breath = -999
+        for i in range(1, len(nose_y) - 1):
+            if nose_y[i] is not None and nose_y[i - 1] is not None and nose_y[i + 1] is not None:
+                if nose_y[i] < nose_y[i - 1] and nose_y[i] < nose_y[i + 1]:
+                    # Nose y goes up (smaller y = higher in frame)
+                    # Check amplitude: nose must have risen by MIN_BREATH_AMPLITUDE
+                    # Compare to the nearest previous local maximum (head down)
+                    # or simply check the drop from the previous peak
+                    if nose_y[i - 1] is not None and nose_y[i] is not None:
+                        rise = nose_y[i - 1] - nose_y[i]
+                        if rise >= MIN_BREATH_AMPLITUDE and i - last_breath >= MIN_BREATH_GAP:
+                            breath_frames.append(i)
+                            last_breath = i
+
+        if not breath_frames:
+            return {'hip_drop': None, 'hip_drop_during_breath': None}
+
+        # Average hip y across all frames as baseline
+        valid_hip = [h for h in hip_y if h is not None]
+        if not valid_hip:
+            return {'hip_drop': None, 'hip_drop_during_breath': None}
+        avg_hip_y = np.mean(valid_hip)
+
+        # Hip drop at breath frames
+        drops = []
+        for bf in breath_frames:
+            if hip_y[bf] is not None:
+                drop = (hip_y[bf] - avg_hip_y) / frame_height
+                drops.append(drop)
+
+        if not drops:
+            return {'hip_drop': None, 'hip_drop_during_breath': None}
+
+        avg_drop = np.mean(drops)
+
+        # Positive drop means hips sank lower (larger y = lower in frame)
+        return {
+            'hip_drop': avg_drop,
+            'hip_drop_during_breath': avg_drop > HIP_DROP_MAX,
+            'num_breaths_detected': len(breath_frames),
+        }
+
+    def _analyze_stroke_phase_timing(self, frames: List[Dict]) -> Dict:
+        """
+        Analyze coordination between arm pull and kick (two-kick rhythm).
+
+        The second kick should align with the end of the pull (wrist passes
+        hip).  We detect:
+          - End-of-pull frames: when wrist x-coordinate passes hip x-coordinate
+            (wrist behind hip → wrist in front of hip)
+          - Kick-peak frames: when ankle reaches maximum extension (knee angle
+            at minimum, indicating down-kick snap)
+
+        We then measure the frame gap between these events.  A gap of
+        0-2 frames is ideal.
+        """
+        if len(frames) < 10:
+            return {'coordination_gap': None, 'aligned': None}
+
+        # Detect end-of-pull events (wrist passes hip)
+        MIN_PULL_GAP = 15  # frames between pulls (~0.5s)
+        pull_events = []
+        wrist_behind_hip = False
+        last_pull = -999
+
+        for i, frame in enumerate(frames):
+            landmarks = frame['pose']['landmarks']
+            # Use left arm as primary (both arms move together in butterfly)
+            lw = landmarks['left_wrist']
+            lh = landmarks['left_hip']
+            rw = landmarks['right_wrist']
+            rh = landmarks['right_hip']
+
+            if (lw['visibility'] >= MIN_VISIBILITY and lh['visibility'] >= MIN_VISIBILITY):
+                # Wrist behind hip (higher x = further back in side view)
+                behind = lw['x'] > lh['x']
+                if behind and not wrist_behind_hip and i - last_pull >= MIN_PULL_GAP:
+                    # Transition: wrist just passed hip (end of pull)
+                    pull_events.append(i)
+                    last_pull = i
+                wrist_behind_hip = behind
+
+        if not pull_events:
+            return {'coordination_gap': None, 'aligned': None}
+
+        # Detect kick-peak events (minimum knee angle = maximum extension)
+        KNEE_MIN = 100.0
+        KNEE_MAX = 170.0
+        MIN_KICK_GAP = 10  # frames between kicks (~0.33s)
+        kick_events = []
+        knee_angles = []
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+            if (landmarks['left_hip']['visibility'] >= MIN_VISIBILITY and
+                landmarks['left_knee']['visibility'] >= MIN_VISIBILITY and
+                landmarks['left_ankle']['visibility'] >= MIN_VISIBILITY):
+                angle = self._calculate_angle(
+                    landmarks['left_hip'],
+                    landmarks['left_knee'],
+                    landmarks['left_ankle']
+                )
+                knee_angles.append(angle)
+            else:
+                knee_angles.append(None)
+
+        # Find minima in knee angles (kick snap), filtering glitches and gaps
+        last_kick = -999
+        for i in range(1, len(knee_angles) - 1):
+            if knee_angles[i] is not None and knee_angles[i - 1] is not None and knee_angles[i + 1] is not None:
+                # Skip impossible angles
+                if not (KNEE_MIN <= knee_angles[i] <= KNEE_MAX):
+                    continue
+                # Also check neighbours are valid
+                if not (KNEE_MIN <= knee_angles[i-1] <= KNEE_MAX) or not (KNEE_MIN <= knee_angles[i+1] <= KNEE_MAX):
+                    continue
+                if knee_angles[i] < knee_angles[i - 1] and knee_angles[i] < knee_angles[i + 1]:
+                    if i - last_kick >= MIN_KICK_GAP:
+                        kick_events.append(i)
+                        last_kick = i
+
+        if not kick_events:
+            return {'coordination_gap': None, 'aligned': None}
+
+        # Match each pull event to the nearest kick event
+        gaps = []
+        for pull in pull_events:
+            nearest = min(kick_events, key=lambda k: abs(k - pull))
+            gaps.append(abs(pull - nearest))
+
+        avg_gap = float(np.mean(gaps))
+
+        return {
+            'coordination_gap': avg_gap,
+            'aligned': avg_gap <= COORDINATION_MAX_GAP,
+            'num_pull_events': len(pull_events),
+            'num_kick_events': len(kick_events),
+        }
+
+    def _analyze_breathing_timing(self, frames: List[Dict]) -> Dict:
+        """
+        Analyze breathing timing — head should descend before hands enter.
+
+        Detects:
+          - Breath-peak frames: when nose y reaches a local maximum (highest)
+          - Hand-entry frames: when wrist y is at a local minimum (lowest,
+            just before arm recovery begins)
+
+        The gap between breath-peak and hand-entry should be small or
+        negative (head already descending when hands enter).
+        """
+        if len(frames) < 5:
+            return {'breath_to_entry_gap': None, 'late_breathing': None}
+
+        # Find breath-peak frames (nose y local minima = highest point)
+        nose_y = []
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+            if landmarks['nose']['visibility'] >= MIN_VISIBILITY:
+                nose_y.append(landmarks['nose']['y'])
+            else:
+                nose_y.append(None)
+
+        MIN_BREATH_GAP = 15        # ~0.5s between breaths
+        MIN_BREATH_AMPLITUDE = 30  # pixels — nose must rise at least this much
+        breath_frames = []
+        last_breath = -999
+        for i in range(1, len(nose_y) - 1):
+            if nose_y[i] is not None and nose_y[i - 1] is not None and nose_y[i + 1] is not None:
+                if nose_y[i] < nose_y[i - 1] and nose_y[i] < nose_y[i + 1]:
+                    rise = nose_y[i - 1] - nose_y[i]
+                    if rise >= MIN_BREATH_AMPLITUDE and i - last_breath >= MIN_BREATH_GAP:
+                        breath_frames.append(i)
+                        last_breath = i
+
+        if not breath_frames:
+            return {'breath_to_entry_gap': None, 'late_breathing': None}
+
+        # Find hand-entry frames: wrist y local minima (hand lowest = entry)
+        wrist_y = []
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+            # Average left/right wrist y
+            lw = landmarks['left_wrist']
+            rw = landmarks['right_wrist']
+            if lw['visibility'] >= MIN_VISIBILITY and rw['visibility'] >= MIN_VISIBILITY:
+                wrist_y.append((lw['y'] + rw['y']) / 2)
+            else:
+                wrist_y.append(None)
+
+        MIN_ENTRY_GAP = 15  # frames between hand entries (~0.5s)
+        entry_frames = []
+        last_entry = -999
+        for i in range(1, len(wrist_y) - 1):
+            if wrist_y[i] is not None and wrist_y[i - 1] is not None and wrist_y[i + 1] is not None:
+                if wrist_y[i] > wrist_y[i - 1] and wrist_y[i] > wrist_y[i + 1]:
+                    # Hand at highest y (lowest in frame) = entry point
+                    if i - last_entry >= MIN_ENTRY_GAP:
+                        entry_frames.append(i)
+                        last_entry = i
+
+        if not entry_frames:
+            return {'breath_to_entry_gap': None, 'late_breathing': None}
+
+        # Match each breath to nearest entry
+        gaps = []
+        for breath in breath_frames:
+            nearest = min(entry_frames, key=lambda e: abs(e - breath))
+            # Positive gap = breath before entry (good: head already descending)
+            # Negative gap = entry before breath (bad: head still high when hands enter)
+            gap = breath - nearest
+            gaps.append(gap)
+
+        avg_gap = float(np.mean(gaps))
+
+        # Negative or small positive gap = late breathing (head still high)
+        late = avg_gap < LATE_BREATHING_MAX_GAP
+
+        return {
+            'breath_to_entry_gap': avg_gap,
+            'late_breathing': late,
+            'num_breaths': len(breath_frames),
+            'num_entries': len(entry_frames),
+        }
+
     @staticmethod
     def _find_peak_timestamps(samples: List[Tuple[float, float]]) -> List[float]:
         """
@@ -588,22 +1033,19 @@ class ButterflyAnalyzer:
         # --- Arm entry width ---
         if self.metrics['entry']['avg_entry_width'] is not None:
             avg_width = self.metrics['entry']['avg_entry_width']
-            # Convert from shoulder-span ratio to a more interpretable metric
-            # We treat it as a normalised value; the rules file uses frame-width
-            # thresholds, but here we compare to shoulder ratio equivalents.
-            if avg_width < 0.6:
+            if avg_width < ARM_ENTRY_WIDTH_MIN:
                 issues.append(ButterflyIssue(
                     'arms_too_narrow',
                     ISSUE_TYPES['arms_too_narrow']['severity'],
-                    f"Arms entering too narrow (wrist span {avg_width:.2f}x shoulder width — should be wider)",
+                    f"Arms entering too narrow (wrist span {avg_width:.2f} of frame width — should be wider)",
                     ISSUE_TYPES['arms_too_narrow']['tip'],
                     avg_width
                 ))
-            elif avg_width > 1.4:
+            elif avg_width > ARM_ENTRY_WIDTH_MAX:
                 issues.append(ButterflyIssue(
                     'arms_too_wide',
                     ISSUE_TYPES['arms_too_wide']['severity'],
-                    f"Arms entering too wide (wrist span {avg_width:.2f}x shoulder width)",
+                    f"Arms entering too wide (wrist span {avg_width:.2f} of frame width)",
                     ISSUE_TYPES['arms_too_wide']['tip'],
                     avg_width
                 ))
@@ -692,11 +1134,124 @@ class ButterflyAnalyzer:
                     delta
                 ))
 
+        # --- Arm recovery ---
+        if self.metrics['recovery']['avg_recovery_height'] is not None:
+            avg_rec = self.metrics['recovery']['avg_recovery_height']
+            if avg_rec > RECOVERY_HEIGHT_EXCESSIVE:
+                issues.append(ButterflyIssue(
+                    'recovery_too_high',
+                    ISSUE_TYPES['recovery_too_high']['severity'],
+                    f"Arm recovery too high (clearance {avg_rec:.2f} of frame height — optimal < {RECOVERY_HEIGHT_MAX})",
+                    ISSUE_TYPES['recovery_too_high']['tip'],
+                    avg_rec
+                ))
+
+        # --- Shoulder-hip phase ---
+        if self.metrics['shoulder_hip_phase']['phase_lag'] is not None:
+            lag = self.metrics['shoulder_hip_phase']['phase_lag']
+            in_phase = self.metrics['shoulder_hip_phase']['in_phase']
+            # Issue: in-phase (positive correlation) OR no correlation (weak relationship)
+            corr = self.metrics['shoulder_hip_phase'].get('cross_correlation', 0)
+            if in_phase or abs(corr) < 0.3:
+                issues.append(ButterflyIssue(
+                    'shoulder_hip_in_phase',
+                    ISSUE_TYPES['shoulder_hip_in_phase']['severity'],
+                    f"Shoulders and hips moving together (phase lag {lag:.2f} of cycle — should be out-of-phase)",
+                    ISSUE_TYPES['shoulder_hip_in_phase']['tip'],
+                    lag
+                ))
+
+        # --- Hip drop during breath ---
+        if self.metrics['hip_during_breath']['hip_drop'] is not None:
+            hip_drop = self.metrics['hip_during_breath']['hip_drop']
+            if hip_drop > HIP_DROP_EXCESSIVE:
+                issues.append(ButterflyIssue(
+                    'hips_drop_during_breath',
+                    ISSUE_TYPES['hips_drop_during_breath']['severity'],
+                    f"Hips drop too low during breath (hip drop {hip_drop:.3f} of frame height)",
+                    ISSUE_TYPES['hips_drop_during_breath']['tip'],
+                    hip_drop
+                ))
+
+        # --- Coordination (kick-pull timing) ---
+        if self.metrics['coordination']['coordination_gap'] is not None:
+            gap = self.metrics['coordination']['coordination_gap']
+            if not self.metrics['coordination']['aligned']:
+                issues.append(ButterflyIssue(
+                    'poor_coordination',
+                    ISSUE_TYPES['poor_coordination']['severity'],
+                    f"Kick and pull not aligned (avg gap {gap:.1f} frames — should be ≤ {COORDINATION_MAX_GAP})",
+                    ISSUE_TYPES['poor_coordination']['tip'],
+                    gap
+                ))
+
+        # --- Breathing timing ---
+        if self.metrics['breathing_timing']['breath_to_entry_gap'] is not None:
+            bt_gap = self.metrics['breathing_timing']['breath_to_entry_gap']
+            late = self.metrics['breathing_timing']['late_breathing']
+            if late:
+                issues.append(ButterflyIssue(
+                    'late_breathing',
+                    ISSUE_TYPES['late_breathing']['severity'],
+                    f"Late breathing — head still high when hands enter (breath-to-entry gap {bt_gap:.1f} frames)",
+                    ISSUE_TYPES['late_breathing']['tip'],
+                    bt_gap
+                ))
+
         # Sort by severity
         severity_order = {SEVERITY_CRITICAL: 0, SEVERITY_MODERATE: 1, SEVERITY_MINOR: 2}
         issues.sort(key=lambda x: severity_order[x.severity])
 
         return issues
+
+    @staticmethod
+    def _filter_active_swimming_frames(frames: List[Dict]) -> List[Dict]:
+        """
+        Filter out preparation/waiting frames where the swimmer is not actively
+        swimming.  Detects active swimming by measuring wrist_x range over a
+        sliding window — during swimming the arms move widely, during
+        preparation the wrist_x is relatively stable.
+
+        Frames with wrist_x range < ACTIVE_THRESHOLD over a 1-second window
+        are marked as inactive and excluded.
+        """
+        ACTIVE_THRESHOLD = 400  # pixel range in wrist_x over 1s window
+        WINDOW = 30  # ~1 second at 30 fps
+
+        if len(frames) < WINDOW:
+            return frames
+
+        # Compute wrist_x for each frame (avg of left/right)
+        wrist_x = []
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
+            lw = landmarks.get('left_wrist')
+            rw = landmarks.get('right_wrist')
+            if lw and rw and lw['visibility'] >= MIN_VISIBILITY and rw['visibility'] >= MIN_VISIBILITY:
+                wrist_x.append((lw['x'] + rw['x']) / 2)
+            else:
+                wrist_x.append(None)
+
+        # Determine active status for each frame
+        active_flags = [False] * len(frames)
+        for i in range(len(frames)):
+            # Look at window centred on this frame
+            half = WINDOW // 2
+            lo = max(0, i - half)
+            hi = min(len(frames), i + half + 1)
+            window_values = [wx for wx in wrist_x[lo:hi] if wx is not None]
+            if len(window_values) >= 10:
+                w_range = max(window_values) - min(window_values)
+                active_flags[i] = w_range >= ACTIVE_THRESHOLD
+
+        # Return only active frames
+        active = [frames[i] for i in range(len(frames)) if active_flags[i]]
+
+        if not active:
+            # Fall back to all frames if nothing is active
+            return frames
+
+        return active
 
     @staticmethod
     def _calculate_angle(point1: Dict, point2: Dict, point3: Dict) -> float:

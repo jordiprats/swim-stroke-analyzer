@@ -17,6 +17,7 @@ from src.stroke_analyzer import StrokeAnalyzer
 from src.butterfly_analyzer import ButterflyAnalyzer
 from src.visualizer import Visualizer
 from src.feedback_generator import FeedbackGenerator
+from src.data_exporter import export_datapoints_csv
 
 
 def main():
@@ -109,8 +110,7 @@ Examples:
 
         # ── Always export datapoints CSV for offline debugging ──
         datapoints_path = os.path.splitext(args.output)[0] + '_datapoints.csv'
-        from src.data_exporter import export_datapoints_csv
-        export_datapoints_csv(pose_data, datapoints_path, args.stroke)
+        export_datapoints_csv(pose_data, datapoints_path)
         print(f"✓ Datapoints saved to {datapoints_path}")
         print("")
 
