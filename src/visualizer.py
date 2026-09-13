@@ -33,6 +33,9 @@ class Visualizer:
         self._undulation_trace = []
         self._undulation_trace_maxlen = 30
 
+        # Persistent color for elbow-diff line (keeps last state when no data)
+        self._last_elbow_diff_color = (255, 255, 255)  # white fallback
+
     def create_annotated_video(
         self,
         pose_data: List[Dict],
@@ -103,7 +106,7 @@ class Visualizer:
                 frame = self._draw_metrics_overlay(frame, pose, analysis_results)
 
             # Draw overall stats in corner
-            frame = self._draw_stats_panel(frame, analysis_results, frame_idx, total_frames)
+            frame = self._draw_stats_panel(frame, pose, analysis_results, frame_idx, total_frames)
 
             writer.write(frame)
             frame_idx += 1
@@ -124,32 +127,30 @@ class Visualizer:
         emphasise simultaneous motion.  An entry-width line is drawn between
         the two wrists when both are visible.
         """
-        if pose['raw_landmarks'] is None:
-            return frame
+        landmarks = pose.get('landmarks', {})
 
-        # Always draw the full skeleton in green first
-        self.mp_drawing.draw_landmarks(
-            frame,
-            pose['raw_landmarks'],
-            self.mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=self.mp_drawing.DrawingSpec(
-                color=self.COLOR_SKELETON,
-                thickness=2,
-                circle_radius=3
-            ),
-            connection_drawing_spec=self.mp_drawing.DrawingSpec(
-                color=self.COLOR_SKELETON,
-                thickness=2
+        # Draw the full MediaPipe skeleton
+        if pose['raw_landmarks'] is not None:
+            self.mp_drawing.draw_landmarks(
+                frame,
+                pose['raw_landmarks'],
+                self.mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=self.mp_drawing.DrawingSpec(
+                    color=self.COLOR_SKELETON,
+                    thickness=2,
+                    circle_radius=3
+                ),
+                connection_drawing_spec=self.mp_drawing.DrawingSpec(
+                    color=self.COLOR_SKELETON,
+                    thickness=2
+                )
             )
-        )
 
-        # --- Butterfly-specific overlays ---
+        # ── Butterfly-specific overlays ──
         if not self._is_butterfly:
             return frame
 
-        landmarks = pose['landmarks']
-
-        # 1. Highlight both arms in cyan (thicker lines for both arm segments)
+        # 1. Highlight visible arm segments in cyan
         arm_segments = [
             ('left_shoulder', 'left_elbow'),
             ('left_elbow', 'left_wrist'),
@@ -157,40 +158,48 @@ class Visualizer:
             ('right_elbow', 'right_wrist'),
         ]
         for (src, dst) in arm_segments:
-            if (landmarks[src]['visibility'] > 0.5 and
-                landmarks[dst]['visibility'] > 0.5):
-                x1, y1 = int(landmarks[src]['x']), int(landmarks[src]['y'])
-                x2, y2 = int(landmarks[dst]['x']), int(landmarks[dst]['y'])
+            src_lm = landmarks.get(src)
+            dst_lm = landmarks.get(dst)
+            if (src_lm and dst_lm and
+                src_lm.get('visibility', 0) > 0.5 and
+                dst_lm.get('visibility', 0) > 0.5):
+                x1, y1 = int(src_lm['x']), int(src_lm['y'])
+                x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
                 cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_BOTH_ARMS, 4)
-                # Small circle at joints
                 cv2.circle(frame, (x1, y1), 6, self.COLOR_BOTH_ARMS, -1)
                 cv2.circle(frame, (x2, y2), 6, self.COLOR_BOTH_ARMS, -1)
 
         # 2. Entry-width line between wrists (magenta)
-        if (landmarks['left_wrist']['visibility'] > 0.5 and
-            landmarks['right_wrist']['visibility'] > 0.5):
-            lx = int(landmarks['left_wrist']['x'])
-            ly = int(landmarks['left_wrist']['y'])
-            rx = int(landmarks['right_wrist']['x'])
-            ry = int(landmarks['right_wrist']['y'])
+        left_wrist = landmarks.get('left_wrist')
+        right_wrist = landmarks.get('right_wrist')
+        if (left_wrist and right_wrist and
+            left_wrist.get('visibility', 0) > 0.5 and
+            right_wrist.get('visibility', 0) > 0.5):
+            lx = int(left_wrist['x'])
+            ly = int(left_wrist['y'])
+            rx = int(right_wrist['x'])
+            ry = int(right_wrist['y'])
             cv2.line(frame, (lx, ly), (rx, ry), self.COLOR_ENTRY_LINE, 2)
 
-        # 3. Dolphin undulation trace — store average hip y per frame
-        if landmarks['left_hip']['visibility'] > 0.5 and landmarks['right_hip']['visibility'] > 0.5:
-            hip_y = (landmarks['left_hip']['y'] + landmarks['right_hip']['y']) / 2
-            hip_x = (landmarks['left_hip']['x'] + landmarks['right_hip']['x']) / 2
-            self._undulation_trace.append((int(hip_x), int(hip_y)))
-            # Keep ring buffer at max length
+        # 3. Dolphin undulation trace — use whichever hip is visible
+        left_hip = landmarks.get('left_hip')
+        right_hip = landmarks.get('right_hip')
+
+        hip_x, hip_y = None, None
+        if left_hip and left_hip.get('visibility', 0) > 0.5:
+            hip_x, hip_y = int(left_hip['x']), int(left_hip['y'])
+        elif right_hip and right_hip.get('visibility', 0) > 0.5:
+            hip_x, hip_y = int(right_hip['x']), int(right_hip['y'])
+
+        if hip_x is not None:
+            self._undulation_trace.append((hip_x, hip_y))
             if len(self._undulation_trace) > self._undulation_trace_maxlen:
                 self._undulation_trace.pop(0)
 
-            # Draw the trace as a fading polyline
             if len(self._undulation_trace) >= 2:
                 for i in range(1, len(self._undulation_trace)):
-                    alpha = i / len(self._undulation_trace)  # newer = brighter
-                    color = tuple(
-                        int(c * alpha) for c in self.COLOR_UNDULATION_TRACE
-                    )
+                    alpha = i / len(self._undulation_trace)
+                    color = tuple(int(c * alpha) for c in self.COLOR_UNDULATION_TRACE)
                     cv2.line(
                         frame,
                         self._undulation_trace[i - 1],
@@ -244,13 +253,16 @@ class Visualizer:
 
         # --- Butterfly sync indicator (badge between wrists) ---
         if is_bf and metrics.get('synchronization', {}).get('sync_delta') is not None:
-            if (landmarks['left_wrist']['visibility'] > 0.5 and
-                landmarks['right_wrist']['visibility'] > 0.5):
+            left_wrist = landmarks.get('left_wrist')
+            right_wrist = landmarks.get('right_wrist')
+            if (left_wrist and right_wrist and
+                left_wrist['visibility'] > 0.5 and
+                right_wrist['visibility'] > 0.5):
 
-                lx = landmarks['left_wrist']['x']
-                rx = landmarks['right_wrist']['x']
+                lx = left_wrist['x']
+                rx = right_wrist['x']
                 mid_x = int((lx + rx) / 2)
-                mid_y = int((landmarks['left_wrist']['y'] + landmarks['right_wrist']['y']) / 2)
+                mid_y = int((left_wrist['y'] + right_wrist['y']) / 2)
 
                 sync_status = metrics['synchronization'].get('synchronized', False)
                 label = "SYNC" if sync_status else "ASYNC"
@@ -264,105 +276,154 @@ class Visualizer:
     def _draw_stats_panel(
         self,
         frame: np.ndarray,
+        pose: Optional[Dict],
         analysis: Dict,
         current_frame: int,
         total_frames: int
     ) -> np.ndarray:
-        """Draw stats panel in corner of frame (works for any stroke type)."""
+        """Draw stats panel in corner of frame.
+
+        Uses a fixed set of lines so the layout never jumps.  Lines that have
+        no data show "---" instead of disappearing.
+        """
         h, w = frame.shape[:2]
 
         # Semi-transparent overlay
         overlay = frame.copy()
-        panel_height = 240
+        panel_height = 280
         cv2.rectangle(overlay, (0, 0), (400, panel_height), self.COLOR_TEXT_BG, -1)
         frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
 
-        # Draw text
-        y_offset = 30
-        line_height = 25
-
-        # Title — detect stroke type from available metrics
         metrics = analysis['metrics']
+        landmarks = pose.get('landmarks', {}) if pose else {}
+
+        # ── Build fixed line list ──
+        lines = []
+
+        # 1. Title
         if 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None:
-            title = "BUTTERFLY ANALYSIS"
+            lines.append(("BUTTERFLY ANALYSIS", self.COLOR_TEXT, 0.6, 2))
         else:
-            title = "FREESTYLE ANALYSIS"
+            lines.append(("FREESTYLE ANALYSIS", self.COLOR_TEXT, 0.6, 2))
 
-        self._draw_text(frame, title, (10, y_offset), scale=0.6, thickness=2)
-        y_offset += line_height + 5
+        # 2. Live elbow angle (left)
+        left_sh = landmarks.get('left_shoulder')
+        left_el = landmarks.get('left_elbow')
+        left_wr = landmarks.get('left_wrist')
+        if (left_sh and left_el and left_wr and
+            left_sh.get('visibility', 0) > 0.5 and
+            left_el.get('visibility', 0) > 0.5 and
+            left_wr.get('visibility', 0) > 0.5):
+            live_angle = self._calculate_angle(left_sh, left_el, left_wr)
+            color = self._get_angle_color(live_angle, 80, 160, 120, reverse=False)
+            lines.append((f"Elbow: {live_angle:.0f}deg", color, 0.5, 1))
+        else:
+            lines.append(("Elbow: ---", self.COLOR_TEXT, 0.5, 1))
 
-        # --- Metrics (stroke-type agnostic: show whatever is available) ---
+        # 3. Head lift
+        nose = landmarks.get('nose')
+        if nose and nose.get('visibility', 0) > 0.3:
+            sh_y = 0
+            sh_count = 0
+            for side in ('left_shoulder', 'right_shoulder'):
+                s = landmarks.get(side)
+                if s and s.get('visibility', 0) > 0.3:
+                    sh_y += s['y']
+                    sh_count += 1
+            if sh_count > 0:
+                sh_avg = sh_y / sh_count
+                lift = nose['y'] - sh_avg
+                color = self.COLOR_CRITICAL if lift > 0.15 else self.COLOR_TEXT
+                lines.append((f"Head lift: {lift:.2f}", color, 0.5, 1))
+            else:
+                lines.append(("Head lift: ---", self.COLOR_TEXT, 0.5, 1))
+        else:
+            lines.append(("Head lift: ---", self.COLOR_TEXT, 0.5, 1))
 
+        # 4. Keypoints visible count
+        vis_count = sum(1 for lm in landmarks.values() if lm.get('visibility', 0) > 0.5)
+        lines.append((f"Keypoints: {vis_count}/33", self.COLOR_TEXT, 0.5, 1))
+
+        # 5. Live per-frame elbow diff (sync indicator)
+        left_sh = landmarks.get('left_shoulder')
+        left_el = landmarks.get('left_elbow')
+        left_wr = landmarks.get('left_wrist')
+        right_sh = landmarks.get('right_shoulder')
+        right_el = landmarks.get('right_elbow')
+        right_wr = landmarks.get('right_wrist')
+        if (left_sh and left_el and left_wr and right_sh and right_el and right_wr and
+            left_sh.get('visibility', 0) > 0.5 and left_el.get('visibility', 0) > 0.5 and
+            left_wr.get('visibility', 0) > 0.5 and right_sh.get('visibility', 0) > 0.5 and
+            right_el.get('visibility', 0) > 0.5 and right_wr.get('visibility', 0) > 0.5):
+            left_angle = self._calculate_angle(left_sh, left_el, left_wr)
+            right_angle = self._calculate_angle(right_sh, right_el, right_wr)
+            diff = abs(left_angle - right_angle)
+            color = self.COLOR_SKELETON if diff < 20 else self.COLOR_CRITICAL
+            self._last_elbow_diff_color = color
+            lines.append((f"Elbow diff: {diff:.0f}°", color, 0.5, 1))
+        else:
+            lines.append(("Elbow diff: ---", self._last_elbow_diff_color, 0.5, 1))
+
+        # 6. Overall average elbow angle
         if metrics.get('elbow', {}).get('avg_angle') is not None:
             elbow_avg = metrics['elbow']['avg_angle']
             color = self._get_angle_color(elbow_avg, 80, 160, 120, reverse=False)
-            self._draw_text(
-                frame,
-                f"Elbow Angle: {elbow_avg:.0f}deg",
-                (10, y_offset),
-                scale=0.5,
-                color=color
-            )
-            y_offset += line_height
+            lines.append((f"Avg elbow: {elbow_avg:.0f}deg", color, 0.4, 1))
+        else:
+            lines.append(("Avg elbow: ---", self.COLOR_TEXT, 0.4, 1))
 
-        # Freestyle rotation
+        # 7. Freestyle rotation
         if metrics.get('rotation', {}).get('avg_rotation') is not None:
-            rotation_avg = metrics['rotation']['avg_rotation']
-            color = self._get_angle_color(rotation_avg, 45, 60, 30, reverse=True)
-            self._draw_text(
-                frame,
-                f"Body Rotation: {rotation_avg:.0f}deg",
-                (10, y_offset),
-                scale=0.5,
-                color=color
-            )
-            y_offset += line_height
+            rot_avg = metrics['rotation']['avg_rotation']
+            color = self._get_angle_color(rot_avg, 45, 60, 30, reverse=True)
+            lines.append((f"Rotation: {rot_avg:.0f}deg", color, 0.4, 1))
+        else:
+            lines.append(("Rotation: ---", self.COLOR_TEXT, 0.4, 1))
 
-        # Butterfly undulation
+        # 8. Butterfly undulation
         if metrics.get('undulation', {}).get('undulation_amplitude') is not None:
             amp = metrics['undulation']['undulation_amplitude']
-            self._draw_text(
-                frame,
-                f"Undulation: {amp:.3f}",
-                (10, y_offset),
-                scale=0.5
-            )
-            y_offset += line_height
+            lines.append((f"Undulation: {amp:.3f}", self.COLOR_TEXT, 0.5, 1))
+        else:
+            lines.append(("Undulation: ---", self.COLOR_TEXT, 0.5, 1))
 
-        # Butterfly arm synchronisation
+        # 9. Butterfly arm synchronisation (video-wide + recent window)
         if metrics.get('synchronization', {}).get('sync_delta') is not None:
             delta = metrics['synchronization']['sync_delta']
-            sync_status = "SYNC" if metrics['synchronization'].get('synchronized') else "ASYNC"
-            color = self.COLOR_SKELETON if metrics['synchronization'].get('synchronized') else self.COLOR_CRITICAL
-            self._draw_text(
-                frame,
-                f"Arm Sync: {delta:.2f}s ({sync_status})",
-                (10, y_offset),
-                scale=0.5,
-                color=color
-            )
-            y_offset += line_height
+            recent = metrics['synchronization'].get('recent_sync_delta')
+            sync_status = metrics['synchronization'].get('synchronized', False)
+            color = self.COLOR_SKELETON if sync_status else self.COLOR_CRITICAL
+            if recent is not None:
+                lines.append((f"Sync: {delta:.1f}° (recent {recent:.1f}°)", color, 0.4, 1))
+            else:
+                lines.append((f"Sync: {delta:.1f}°", color, 0.4, 1))
+        else:
+            lines.append(("Sync: ---", self.COLOR_TEXT, 0.4, 1))
 
-        # Butterfly arm entry width
+        # 10. Butterfly entry width
         if metrics.get('entry', {}).get('avg_entry_width') is not None:
             ew = metrics['entry']['avg_entry_width']
-            self._draw_text(
-                frame,
-                f"Entry Width: {ew:.2f}x shoulder",
-                (10, y_offset),
-                scale=0.5
-            )
-            y_offset += line_height
+            lines.append((f"Entry Width: {ew:.2f}x", self.COLOR_TEXT, 0.5, 1))
+        else:
+            lines.append(("Entry Width: ---", self.COLOR_TEXT, 0.5, 1))
 
+        # 11. Stroke rate
         if metrics.get('stroke_rate', {}).get('spm') is not None:
             spm = metrics['stroke_rate']['spm']
-            self._draw_text(
-                frame,
-                f"Stroke Rate: {spm:.0f} SPM",
-                (10, y_offset),
-                scale=0.5
-            )
-            y_offset += line_height
+            lines.append((f"Stroke Rate: {spm:.0f} SPM", self.COLOR_TEXT, 0.5, 1))
+        else:
+            lines.append(("Stroke Rate: ---", self.COLOR_TEXT, 0.5, 1))
+
+        # ── Render all lines at fixed positions ──
+        y_offset = 30
+        line_height = 22
+        for i, (text, color, scale, thickness) in enumerate(lines):
+            if i == 0:
+                self._draw_text(frame, text, (10, y_offset), scale=scale, color=color, thickness=thickness)
+                y_offset += line_height + 8
+            else:
+                self._draw_text(frame, text, (10, y_offset), scale=scale, color=color, thickness=thickness)
+                y_offset += line_height
 
         # Progress bar
         progress = current_frame / total_frames

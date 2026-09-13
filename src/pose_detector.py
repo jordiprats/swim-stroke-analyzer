@@ -73,7 +73,7 @@ class PoseDetector:
             'frame_shape': (h, w)
         }
 
-    def process_video(self, video_path: str, skip_frames: int = 2) -> List[Dict]:
+    def process_video(self, video_path: str, skip_frames: int = 1) -> List[Dict]:
         """
         Process video and extract pose data (skips frames for speed).
 

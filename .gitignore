@@ -27,10 +27,6 @@ frontend/build/
 # Design assistant outputs
 design_recommendations/
 
-# Large model files (118 MB) — download separately
-models/*.pt
-!models/.gitkeep
-
 # API keys and secrets (NEVER COMMIT!)
 .env
 *.key

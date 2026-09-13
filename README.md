@@ -427,6 +427,8 @@ python main.py video.mp4 --report-only
 python main.py video.mp4 --no-report
 ```
 
+---
+
 ## Butterfly Support 🦋
 
 The analyzer now supports **butterfly stroke** in addition to freestyle.
@@ -464,21 +466,6 @@ When analyzing butterfly, the annotated video shows:
 ```bash
 # Upload for butterfly analysis
 curl -F "video=@swim.mp4" -F "stroke=butterfly" http://localhost:5001/api/upload
-```
-
-### Demo GIFs
-Two synthetic animations are included to illustrate how the skeleton overlay works:
-
-| File | What it shows |
-|---|---|
-| `demo_freestyle.gif` | Stick-figure with alternating arm strokes, green skeleton, elbow angle annotations, body roll |
-| `demo_butterfly.gif` | Both-arms-together motion, cyan arm highlights, magenta entry-width line, SYNC badge, hip undulation trail |
-
-Open these in your browser to see the overlay in action without needing a real video.
-
-```bash
-open demo_freestyle.gif   # macOS
-open demo_butterfly.gif
 ```
 
 ---

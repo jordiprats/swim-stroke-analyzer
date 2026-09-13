@@ -79,9 +79,15 @@ class ButterflyAnalyzer:
         }
 
     def _analyze_elbow_angles(self, frames: List[Dict]) -> Dict:
-        """Analyze elbow angles during the pull phase."""
+        """Analyze elbow angles during the pull phase.
+
+        Filters out outlier angles (< 20° or > 160°) that are clearly
+        pose-estimation glitches (a human arm cannot bend that far).
+        """
         left_elbow_angles = []
         right_elbow_angles = []
+        ELBOW_MIN = 20.0
+        ELBOW_MAX = 160.0
 
         for frame in frames:
             landmarks = frame['pose']['landmarks']
@@ -98,7 +104,8 @@ class ButterflyAnalyzer:
                 landmarks['left_elbow'],
                 landmarks['left_wrist']
             )
-            left_elbow_angles.append(angle)
+            if ELBOW_MIN <= angle <= ELBOW_MAX:
+                left_elbow_angles.append(angle)
 
             # Right elbow angle
             if (landmarks['right_shoulder']['visibility'] >= MIN_VISIBILITY and
@@ -110,7 +117,8 @@ class ButterflyAnalyzer:
                     landmarks['right_elbow'],
                     landmarks['right_wrist']
                 )
-                right_elbow_angles.append(angle)
+                if ELBOW_MIN <= angle <= ELBOW_MAX:
+                    right_elbow_angles.append(angle)
 
         all_angles = left_elbow_angles + right_elbow_angles
 
@@ -129,8 +137,12 @@ class ButterflyAnalyzer:
         In butterfly both arms enter simultaneously.  We measure the distance
         between the two wrists as a fraction of shoulder width — too narrow
         reduces pull length, too wide loses leverage.
+
+        Filters out outlier ratios (> 6.0) caused by pose-estimation glitches
+        where the model places one wrist far from the body.
         """
         entry_widths = []
+        MAX_SANE_RATIO = 6.0
 
         for frame in frames:
             landmarks = frame['pose']['landmarks']
@@ -151,7 +163,8 @@ class ButterflyAnalyzer:
 
             # Ratio: 1.0 means wrist span = shoulder span
             ratio = wrist_span / shoulder_span
-            entry_widths.append(ratio)
+            if ratio <= MAX_SANE_RATIO:
+                entry_widths.append(ratio)
 
         if not entry_widths:
             return {
@@ -395,7 +408,19 @@ class ButterflyAnalyzer:
         We also compute the **angle between the two arm vectors**
         (shoulder → wrist) — this should be near 0 when both arms are
         in the same phase and grows when they are offset.
+
+        Improvements:
+          - Stricter visibility threshold (0.7) for wrist landmarks
+          - Outlier filtering: skip frames where either elbow angle is
+            outside 20-160° (pose-estimation glitches)
+          - Running-window sync (last 30 frames) reported alongside the
+            video-wide average for real-time responsiveness
         """
+        SYNC_WINDOW = 30
+        ELBOW_MIN = 20.0
+        ELBOW_MAX = 160.0
+        STRICT_VIS = 0.7
+
         if len(frames) < 5:
             return {'sync_delta': None, 'synchronized': None}
 
@@ -405,15 +430,15 @@ class ButterflyAnalyzer:
         for frame in frames:
             landmarks = frame['pose']['landmarks']
 
-            # --- Elbow angle comparison ---
+            # --- Elbow angle comparison (stricter wrist visibility) ---
             left_ok = all(
                 landmarks.get(s, {}).get('visibility', 0) >= MIN_VISIBILITY
                 for s in ('left_shoulder', 'left_elbow', 'left_wrist')
-            )
+            ) and landmarks.get('left_wrist', {}).get('visibility', 0) >= STRICT_VIS
             right_ok = all(
                 landmarks.get(s, {}).get('visibility', 0) >= MIN_VISIBILITY
                 for s in ('right_shoulder', 'right_elbow', 'right_wrist')
-            )
+            ) and landmarks.get('right_wrist', {}).get('visibility', 0) >= STRICT_VIS
 
             if left_ok and right_ok:
                 left_angle = self._calculate_angle(
@@ -426,7 +451,10 @@ class ButterflyAnalyzer:
                     landmarks['right_elbow'],
                     landmarks['right_wrist']
                 )
-                elbow_diffs.append(abs(left_angle - right_angle))
+                # Skip frames where either angle is an outlier
+                if (ELBOW_MIN <= left_angle <= ELBOW_MAX and
+                    ELBOW_MIN <= right_angle <= ELBOW_MAX):
+                    elbow_diffs.append(abs(left_angle - right_angle))
 
             # --- Arm-vector angle (shoulder → wrist) relative to body axis ---
             if all(
@@ -434,13 +462,15 @@ class ButterflyAnalyzer:
                 for s in ('left_shoulder', 'right_shoulder',
                           'left_hip', 'right_hip',
                           'left_wrist', 'right_wrist')
+            ) and all(
+                landmarks.get(s, {}).get('visibility', 0) >= STRICT_VIS
+                for s in ('left_wrist', 'right_wrist')
             ):
                 # Body axis (vertical): shoulder midpoint → hip midpoint
                 sx = (landmarks['left_shoulder']['x'] + landmarks['right_shoulder']['x']) / 2
                 sy = (landmarks['left_shoulder']['y'] + landmarks['right_shoulder']['y']) / 2
                 hx = (landmarks['left_hip']['x'] + landmarks['right_hip']['x']) / 2
                 hy = (landmarks['left_hip']['y'] + landmarks['right_hip']['y']) / 2
-                body_vec = np.array([hx - sx, hy - sy])  # downward in image
 
                 # Left arm vector (shoulder → wrist)
                 lv = np.array([
@@ -467,6 +497,14 @@ class ButterflyAnalyzer:
             return {'sync_delta': None, 'synchronized': None}
 
         avg_elbow_diff = float(np.mean(elbow_diffs))
+
+        # ── Running-window sync (last SYNC_WINDOW valid diffs) ──
+        if len(elbow_diffs) > SYNC_WINDOW:
+            recent_diffs = elbow_diffs[-SYNC_WINDOW:]
+        else:
+            recent_diffs = elbow_diffs
+        recent_sync = float(np.mean(recent_diffs))
+
         avg_arm_angle = float(np.mean(arm_angle_diffs)) if arm_angle_diffs else None
 
         # Heuristic thresholds:
@@ -484,9 +522,14 @@ class ButterflyAnalyzer:
         # asymmetry, but we don't gate on it.
         synchronized = sync_elbow
 
+        # Also check recent sync separately (may differ from video-wide)
+        recent_synchronized = recent_sync <= 20.0
+
         return {
             'sync_delta': avg_elbow_diff,
             'synchronized': synchronized,
+            'recent_sync_delta': recent_sync,
+            'recent_synchronized': recent_synchronized,
             'avg_elbow_diff': avg_elbow_diff,
             'avg_arm_angle': avg_arm_angle,
         }

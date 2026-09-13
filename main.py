@@ -2,7 +2,8 @@
 """
 Swim Stroke Analyzer - Main CLI Entry Point
 
-Analyzes freestyle swimming technique from video and provides coaching feedback.
+Analyzes freestyle or butterfly swimming technique from video
+and provides coaching feedback.
 """
 
 import argparse
@@ -21,17 +22,17 @@ from src.feedback_generator import FeedbackGenerator
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description='Analyze freestyle swimming technique from video',
+        description='Analyze swimming technique from video',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze a video and generate report + annotated video
+  # Analyze a video
   python main.py video.mp4
 
-  # Specify custom output path
-  python main.py video.mp4 -o output/analysis.mp4
+  # Analyze butterfly
+  python main.py video.mp4 --stroke butterfly
 
-  # Generate report only (no video output)
+  # Generate report only
   python main.py video.mp4 --report-only
         """
     )
@@ -66,6 +67,14 @@ Examples:
         help='Skip text report, only generate annotated video'
     )
 
+
+    parser.add_argument(
+        '--analyze-every',
+        type=int,
+        default=1,
+        help='Process every Nth frame (1 = every frame, 2 = every other). Default: 1'
+    )
+
     args = parser.parse_args()
 
     # Validate input file
@@ -89,7 +98,7 @@ Examples:
         # Step 1: Extract pose data from video
         print("Step 1/4: Detecting pose in video frames...")
         detector = PoseDetector()
-        pose_data = detector.process_video(args.video)
+        pose_data = detector.process_video(args.video, skip_frames=args.analyze_every)
 
         if not pose_data:
             print("Error: Failed to process video")
@@ -97,6 +106,14 @@ Examples:
 
         print(f"✓ Processed {len(pose_data)} frames")
         print("")
+
+        # ── Always export datapoints CSV for offline debugging ──
+        datapoints_path = os.path.splitext(args.output)[0] + '_datapoints.csv'
+        from src.data_exporter import export_datapoints_csv
+        export_datapoints_csv(pose_data, datapoints_path, args.stroke)
+        print(f"✓ Datapoints saved to {datapoints_path}")
+        print("")
+
 
         # Step 2: Analyze stroke mechanics
         stroke_label = args.stroke.capitalize()
@@ -126,7 +143,7 @@ Examples:
             print(report)
             print("")
 
-            # Save report to file — use splitext so any extension works
+            # Save report to file
             report_path = os.path.splitext(args.output)[0] + '_report.txt'
             with open(report_path, 'w') as f:
                 f.write(report)
