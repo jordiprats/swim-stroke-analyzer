@@ -77,7 +77,7 @@ HIP_DROP_MAX = 0.03                 # 3% of frame height – max hip drop during
 HIP_DROP_EXCESSIVE = 0.06           # Above → hips sink too much when breathing
 
 # --- Visibility ---
-MIN_VISIBILITY = 0.5
+MIN_VISIBILITY = 0.3
 
 # --- Severity Levels ---
 SEVERITY_CRITICAL = "critical"

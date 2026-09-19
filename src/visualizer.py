@@ -289,9 +289,9 @@ class Visualizer:
         if metrics.get('elbow', {}).get('avg_angle') is not None:
 
             # Left elbow
-            if (landmarks['left_shoulder']['visibility'] > 0.5 and
-                landmarks['left_elbow']['visibility'] > 0.5 and
-                landmarks['left_wrist']['visibility'] > 0.5):
+            if (landmarks['left_shoulder']['visibility'] > 0.3 and
+                landmarks['left_elbow']['visibility'] > 0.3 and
+                landmarks['left_wrist']['visibility'] > 0.3):
 
                 angle = self._calculate_angle(
                     landmarks['left_shoulder'],
@@ -303,9 +303,9 @@ class Visualizer:
                 self._draw_angle_annotation(frame, pos, angle, color)
 
             # Right elbow (butterfly shows both; freestyle shows left only)
-            if is_bf and (landmarks['right_shoulder']['visibility'] > 0.5 and
-                landmarks['right_elbow']['visibility'] > 0.5 and
-                landmarks['right_wrist']['visibility'] > 0.5):
+            if is_bf and (landmarks['right_shoulder']['visibility'] > 0.3 and
+                landmarks['right_elbow']['visibility'] > 0.3 and
+                landmarks['right_wrist']['visibility'] > 0.3):
 
                 angle = self._calculate_angle(
                     landmarks['right_shoulder'],
@@ -321,8 +321,8 @@ class Visualizer:
             left_wrist = landmarks.get('left_wrist')
             right_wrist = landmarks.get('right_wrist')
             if (left_wrist and right_wrist and
-                left_wrist['visibility'] > 0.5 and
-                right_wrist['visibility'] > 0.5):
+                left_wrist['visibility'] > 0.3 and
+                right_wrist['visibility'] > 0.3):
 
                 lx = left_wrist['x']
                 rx = right_wrist['x']
@@ -380,9 +380,9 @@ class Visualizer:
         left_el = landmarks.get('left_elbow')
         left_wr = landmarks.get('left_wrist')
         if (left_sh and left_el and left_wr and
-            left_sh.get('visibility', 0) > 0.5 and
-            left_el.get('visibility', 0) > 0.5 and
-            left_wr.get('visibility', 0) > 0.5):
+            left_sh.get('visibility', 0) > 0.3 and
+            left_el.get('visibility', 0) > 0.3 and
+            left_wr.get('visibility', 0) > 0.3):
             live_angle = self._calculate_angle(left_sh, left_el, left_wr)
             color = self._get_angle_color(live_angle, elbow_opt_min, elbow_opt_max, elbow_crit, reverse=False)
             lines.append((f"Elbow(3D): {live_angle:.0f}deg", color, 0.5, 1))
@@ -410,7 +410,7 @@ class Visualizer:
             lines.append(("Head lift: ---", self.COLOR_TEXT, 0.5, 1))
 
         # 4. Keypoints visible count
-        vis_count = sum(1 for lm in landmarks.values() if lm.get('visibility', 0) > 0.5)
+        vis_count = sum(1 for lm in landmarks.values() if lm.get('visibility', 0) > 0.3)
         lines.append((f"Keypoints: {vis_count}/33", self.COLOR_TEXT, 0.5, 1))
 
         # 5. Live per-frame elbow diff (sync indicator)
@@ -421,9 +421,9 @@ class Visualizer:
         right_el = landmarks.get('right_elbow')
         right_wr = landmarks.get('right_wrist')
         if (left_sh and left_el and left_wr and right_sh and right_el and right_wr and
-            left_sh.get('visibility', 0) > 0.5 and left_el.get('visibility', 0) > 0.5 and
-            left_wr.get('visibility', 0) > 0.5 and right_sh.get('visibility', 0) > 0.5 and
-            right_el.get('visibility', 0) > 0.5 and right_wr.get('visibility', 0) > 0.5):
+            left_sh.get('visibility', 0) > 0.3 and left_el.get('visibility', 0) > 0.3 and
+            left_wr.get('visibility', 0) > 0.3 and right_sh.get('visibility', 0) > 0.3 and
+            right_el.get('visibility', 0) > 0.3 and right_wr.get('visibility', 0) > 0.3):
             left_angle = self._calculate_angle(left_sh, left_el, left_wr)
             right_angle = self._calculate_angle(right_sh, right_el, right_wr)
             diff = abs(left_angle - right_angle)

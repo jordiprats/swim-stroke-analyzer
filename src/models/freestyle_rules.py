@@ -26,7 +26,7 @@ KNEE_ANGLE_OPTIMAL = 170  # Nearly straight
 KNEE_ANGLE_EXCESSIVE_BEND = 140  # Too much bending
 
 # Visibility threshold for landmark confidence
-MIN_VISIBILITY = 0.5
+MIN_VISIBILITY = 0.3
 
 # Issue severity levels
 SEVERITY_CRITICAL = "critical"

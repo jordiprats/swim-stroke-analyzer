@@ -466,7 +466,7 @@ class ButterflyAnalyzer:
         SYNC_WINDOW = 30
         ELBOW_MIN = 20.0
         ELBOW_MAX = 180.0
-        STRICT_VIS = 0.7
+        STRICT_VIS = 0.3
 
         if len(frames) < 5:
             return {'sync_delta': None, 'synchronized': None}
