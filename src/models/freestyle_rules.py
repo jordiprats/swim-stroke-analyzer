@@ -90,6 +90,11 @@ ISSUE_TYPES = {
         'tip': 'Slow down and focus on longer strokes. Glide more after each stroke. Distance per stroke is more efficient.',
         'severity': SEVERITY_MINOR,
     },
+    'inconsistent_catch': {
+        'name': 'Inconsistent Catch Angle',
+        'tip': 'Focus on maintaining a consistent elbow position at catch. Practice catch drills with a slow tempo to lock in the feel.',
+        'severity': SEVERITY_MODERATE,
+    },
 }
 
 

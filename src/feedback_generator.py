@@ -33,6 +33,8 @@ class FeedbackGenerator:
         """
         metrics = analysis_results['metrics']
         issues = analysis_results['issues']
+        cycles = analysis_results.get('cycles', None)
+        is_precision = cycles is not None and len(cycles) > 0
 
         is_butterfly = stroke_type == 'butterfly' or 'undulation' in metrics
 
@@ -57,6 +59,8 @@ class FeedbackGenerator:
         # ====== HEADER WITH SCORE ======
         stroke_label = "BUTTERFLY" if is_butterfly else "FREESTYLE"
         report.append(f"\U0001f3ca\u200d\u2642\ufe0f YOUR {stroke_label} ANALYSIS")
+        if is_precision:
+            report.append(f"   Mode: PRECISION (cycle-based, {len(cycles)} cycles detected)")
         report.append("")
         report.append(f"Overall Technique Score: {rating}/10")
         report.append("")
@@ -68,6 +72,39 @@ class FeedbackGenerator:
         report.append("\u2500" * 36)
         report.append(insight)
         report.append("")
+
+        # ====== PRECISION METRICS (cycle breakdown) ======
+        if is_precision:
+            report.append("\U0001f4ca CYCLE BREAKDOWN")
+            report.append("\u2500" * 36)
+            cycle_data = metrics.get('cycle_analysis', {}).get('per_cycle', [])
+            if cycle_data:
+                for c in cycle_data:
+                    num = c.get('cycle', '?')
+                    dur = c.get('duration', '?')
+                    elbow = c.get('avg_elbow')
+                    if elbow is not None:
+                        report.append(f"  Cycle {num}: {dur} frames, avg elbow(3D) {elbow:.0f}°")
+                    else:
+                        report.append(f"  Cycle {num}: {dur} frames")
+                report.append("")
+                # Consistency score
+                consistency = metrics.get('cycle_analysis', {}).get('elbow_consistency', {})
+                if consistency.get('score') is not None:
+                    report.append(f"  Elbow consistency across cycles: {consistency['score']:.0%} "
+                                  f"(variability: {consistency['variability']:.2f})")
+                    report.append("")
+
+            # Phase-specific metrics
+            if metrics.get('catch', {}).get('catch_elbow_angle', {}).get('value') is not None:
+                ce = metrics['catch']['catch_elbow_angle']
+                report.append(f"  Catch elbow angle (3D): {ce['value']:.0f}° (median, "
+                              f"{ce['n_samples']} frames, conf: {ce['confidence']:.0%})")
+            if metrics.get('pull', {}).get('pull_elbow_angle', {}).get('value') is not None:
+                pe = metrics['pull']['pull_elbow_angle']
+                report.append(f"  Pull elbow angle (3D): {pe['value']:.0f}° (median, "
+                              f"{pe['n_samples']} frames, conf: {pe['confidence']:.0%})")
+            report.append("")
 
         # ====== BIGGEST RED FLAG (if any) ======
         if critical_issues:
@@ -110,6 +147,23 @@ class FeedbackGenerator:
             for i, issue in enumerate(moderate_issues[:2], start_num):  # Only top 2 moderate
                 report.append(f"{i}. \u26a0\ufe0f IMPORTANT: {issue.description}")
                 report.append(f"   \u2192 {issue.tip}")
+                report.append("")
+
+        # ====== CONFIDENCE NOTES ======
+        if is_precision:
+            # Check if any metrics have low confidence
+            low_conf_metrics = []
+            for key, val in metrics.items():
+                if isinstance(val, dict) and val.get('confidence') is not None:
+                    if val['confidence'] < 0.4:
+                        low_conf_metrics.append(f"{key} ({val['confidence']:.0%})")
+            if low_conf_metrics:
+                report.append("\U0001f4a1 CONFIDENCE NOTES")
+                report.append("\u2500" * 36)
+                report.append("  Some metrics have low confidence due to poor detection:")
+                for m in low_conf_metrics[:3]:
+                    report.append(f"  \u2022 {m}")
+                report.append("  Consider re-recording with better lighting/camera angle.")
                 report.append("")
 
         # ====== DETAILED BREAKDOWN (Collapsed by default in UI) ======
@@ -246,7 +300,7 @@ class FeedbackGenerator:
             if metrics.get('elbow', {}).get('avg_angle'):
                 angle = metrics['elbow']['avg_angle']
                 if 120 <= angle <= 160:
-                    strengths.append("Good elbow bend during pull — maintaining leverage!")
+                    strengths.append("Good elbow bend (3D) during pull — maintaining leverage!")
 
             if metrics.get('undulation', {}).get('undulation_amplitude'):
                 amp = metrics['undulation']['undulation_amplitude']
@@ -315,6 +369,50 @@ class FeedbackGenerator:
         # Detect stroke type
         is_butterfly = 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None
 
+        # Detect precision mode
+        is_precision = metrics.get('num_cycles', 0) > 0 or metrics.get('catch', {}).get('catch_elbow_angle', {}).get('value') is not None
+
+        if is_precision:
+            lines.append(f"\U0001f7b8 Analysis Mode: Precision (cycle-based)")
+            lines.append(f"   Stroke cycles detected: {metrics.get('num_cycles', '?')}")
+            lines.append("")
+
+        # Phase-specific metrics (precision mode)
+        if is_precision:
+            if metrics.get('catch', {}).get('catch_elbow_angle', {}).get('value') is not None:
+                ce = metrics['catch']['catch_elbow_angle']
+                lines.append(f"\U0001f7b8 Catch Phase:")
+                lines.append(f"   Elbow angle: {ce['value']:.0f}\u00b0 (median, "
+                              f"conf: {ce['confidence']:.0%})")
+                if metrics['catch'].get('catch_elbow_angle_iqr') is not None:
+                    lines.append(f"   IQR: {metrics['catch']['catch_elbow_angle_iqr']:.1f}\u00b0")
+                lines.append("")
+
+            if metrics.get('pull', {}).get('pull_elbow_angle', {}).get('value') is not None:
+                pe = metrics['pull']['pull_elbow_angle']
+                lines.append(f"\U0001f7b8 Pull Phase:")
+                lines.append(f"   Elbow angle: {pe['value']:.0f}\u00b0 (median, "
+                              f"conf: {pe['confidence']:.0%})")
+                if metrics['pull'].get('pull_elbow_max') is not None:
+                    lines.append(f"   Max: {metrics['pull']['pull_elbow_max']:.0f}\u00b0")
+                lines.append("")
+
+            if metrics.get('recovery', {}).get('wrist_clearance', {}).get('value') is not None:
+                rc = metrics['recovery']['wrist_clearance']
+                lines.append(f"\U0001f7b8 Recovery Phase:")
+                lines.append(f"   Wrist clearance: {rc['value']:.2f} (normalized, "
+                              f"conf: {rc['confidence']:.0%})")
+                lines.append("")
+
+            # Consistency
+            consistency = metrics.get('cycle_analysis', {}).get('elbow_consistency', {})
+            if consistency.get('score') is not None:
+                lines.append(f"\U0001f7b8 Cycle Consistency:")
+                lines.append(f"   Score: {consistency['score']:.0%} (variability: {consistency['variability']:.2f})")
+                lines.append(f"   Mean elbow: {consistency['mean']:.0f}\u00b0 ("
+                              f"{consistency['n_cycles']} cycles)")
+                lines.append("")
+
         # Elbow metrics
         if metrics.get('elbow', {}).get('avg_angle') is not None:
             elbow = metrics['elbow']
@@ -324,7 +422,13 @@ class FeedbackGenerator:
             else:
                 lines.append(f"\U0001f7b8 Elbow Catch Angle:")
                 lines.append(f"   Average: {elbow['avg_angle']:.1f}\u00b0 (optimal: 80-100\u00b0)")
-            if elbow['left_avg'] and elbow['right_avg']:
+            if elbow.get('median_angle') is not None:
+                lines.append(f"   Median: {elbow['median_angle']:.1f}\u00b0")
+            if elbow.get('iqr') is not None:
+                lines.append(f"   IQR: {elbow['iqr']:.1f}\u00b0")
+            if elbow.get('confidence') is not None:
+                lines.append(f"   Confidence: {elbow['confidence']:.0%}")
+            if elbow.get('left_avg') is not None and elbow.get('right_avg') is not None:
                 lines.append(f"   Left: {elbow['left_avg']:.1f}\u00b0 | Right: {elbow['right_avg']:.1f}\u00b0")
             lines.append("")
 

@@ -1,424 +1,447 @@
 """
-Post-processing pose data to fill in missed detections and filter implausible movements.
+Advanced pose smoothing: Savitzky–Golay + One Euro + Kalman + Occlusion handling.
 
-Since analysis is not real-time, we can look ahead and behind to:
-  1. Interpolate frames where pose detection failed (pose=None).
-  2. Apply kinematic constraints — discard or down-weight landmark positions
-     that imply impossible joint movement between consecutive frames.
-  3. Detect implausible landmark proximities (e.g., wrist too close to
-     shoulder, elbows crossing) and flag them as low-visibility.
+This replaces the old simple moving-average + interpolation approach with
+proper temporal filters that trade speed for significantly better accuracy.
 
-The output pose_data list preserves the same structure, but with fewer
-pose=None entries and corrected landmark visibility values.
+Filters applied per-landmark:
+  1. Savitzky–Golay (scipy) — preserves high-frequency biomechanics (stroke
+     transitions) while removing per-frame pose-estimation jitter.
+  2. One Euro filter — adaptive low-pass that reduces latency during fast
+     movements (recovery) and smooths aggressively during slow movements (catch).
+  3. Kalman filter (lightweight, per-coordinate) — used on torso landmarks
+     (shoulders, hips) that should have very smooth trajectories.
+  4. Occlusion interpolation — fills short gaps (< 5 frames) with cubic
+     spline interpolation instead of linear, preserving movement curvature.
+
+All filters operate on the full time series after detection, so we can use
+non-causal (centred) windows — impossible in real-time.
 """
 
 import numpy as np
 from typing import List, Dict, Optional, Tuple
+from scipy.signal import savgol_filter
+from collections import defaultdict
 
-# ── Kinematic limits (heuristic, tuned for swimming at ~30 fps after skip=2) ──
+# ── Tunable parameters ──
 
-# Maximum pixel displacement per frame for a joint centre (based on frame
-# dimensions ~1280×720).  At 30 fps a swimmer's hand can move ~200 px/frame
-# during a fast recovery; anything above 300 px/frame is almost certainly a
-# tracking glitch.
-MAX_PIXEL_DELTA_PER_FRAME = 300
+# Savitzky–Golay: window length must be odd, polyorder ≤ window length
+SG_WINDOW = 9          # Frames — 9 @ 30fps ≈ 300ms temporal context
+SG_POLYORDER = 3       # Cubic fit — good for smooth joint trajectories
 
-# Maximum change in joint angle per frame (degrees).  Elbow angle shouldn't
-# change more than ~40° per frame during normal swimming; 60+ indicates a
-# tracking jump.
-MAX_ANGLE_DELTA_PER_FRAME = 50
+# One Euro filter parameters
+ONE_EURO_BETA = 0.7    # Low-speed cutoff frequency (lower = smoother)
+ONE_EURO_MIN_CUTOFF = 0.1  # Hz — minimum cutoff during slow motion
+ONE_EURO_CUTOFF_AT_RATE = 1.0  # How much cutoff increases with speed
 
-# Minimum distance between two distinct landmarks that should never overlap
-# (in pixels).  If e.g. wrist and shoulder are within 20 px, the wrist
-# position is likely a hallucination.
-MIN_LANDMARK_SEPARATION = 30
+# Kalman filter parameters (per-coordinate)
+KALMAN_PROCESS_NOISE = 1e-3   # How much we trust the motion model
+KALMAN_MEASUREMENT_NOISE = 0.5  # How much we trust each measurement
 
-# Landmark pairs that should never be very close (they're far apart on the body)
-CLOSE_CHECK_PAIRS = [
-    ('left_wrist', 'left_shoulder'),
-    ('right_wrist', 'right_shoulder'),
-    ('left_wrist', 'left_hip'),
-    ('right_wrist', 'right_hip'),
-    ('left_ankle', 'left_shoulder'),
-    ('right_ankle', 'right_shoulder'),
-    ('left_elbow', 'right_elbow'),
-    ('left_wrist', 'right_wrist'),  # In freestyle they shouldn't overlap
-]
+# Maximum gap (in frames) for spline interpolation; longer gaps get linear
+MAX_SPLINE_GAP = 5
 
-# Landmarks whose movement should be relatively smooth (hips, shoulders)
-SMOOTH_LANDMARKS = [
-    'left_shoulder', 'right_shoulder',
-    'left_hip', 'right_hip',
-]
-
-MIN_VISIBILITY = 0.5
+# Landmarks that get Kalman filtering (torso — should be very smooth)
+KALMAN_LANDMARKS = {'left_shoulder', 'right_shoulder', 'left_hip', 'right_hip'}
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
+# ── Helper classes ──
 
-def _euclidean(a: Dict, b: Dict) -> float:
-    """Euclidean distance between two landmarks (x, y)."""
-    dx = a['x'] - b['x']
-    dy = a['y'] - b['y']
-    return float(np.sqrt(dx * dx + dy * dy))
+class OneEuroFilter:
+    """Lightweight 1D One Euro filter for a single coordinate signal."""
 
+    def __init__(self, beta: float = ONE_EURO_BETA,
+                 min_cutoff: float = ONE_EURO_MIN_CUTOFF,
+                 cutoff_at_rate: float = ONE_EURO_CUTOFF_AT_RATE):
+        self.beta = beta
+        self.min_cutoff = min_cutoff
+        self.cutoff_at_rate = cutoff_at_rate
+        self.prev_low = None
+        self.prev_dx = None
+        self.dt = 1.0  # Assume uniform frame rate; caller can override
 
-def _lerp(a: Dict, b: Dict, t: float) -> Dict:
-    """Linearly interpolate between two landmarks at blend factor t."""
-    z = a.get('z', 0) + t * (b.get('z', 0) - a.get('z', 0))
-    vis = a.get('visibility', 0) + t * (b.get('visibility', 0) - a.get('visibility', 0))
-    return {
-        'x': a['x'] + t * (b['x'] - a['x']),
-        'y': a['y'] + t * (b['y'] - a['y']),
-        'z': z,
-        'visibility': float(vis),
-    }
+    def apply(self, signal: np.ndarray) -> np.ndarray:
+        """Apply One Euro filter to a 1-D signal array."""
+        if len(signal) < 2:
+            return signal.copy()
 
+        out = np.empty_like(signal)
+        dx = 0.0
+        low_pass = signal[0]
 
-def _copy_landmark(src: Dict) -> Dict:
-    """Deep-copy a landmark dict."""
-    return {
-        'x': src['x'],
-        'y': src['y'],
-        'z': src.get('z', 0),
-        'visibility': src.get('visibility', 0),
-    }
+        for i in range(len(signal)):
+            dt = self.dt
+            if self.prev_low is not None:
+                dx = (signal[i] - self.prev_low) / dt
 
+            # Cutoff frequency: increases with movement speed
+            cutoff = self.min_cutoff + self.beta * abs(dx)
+            # Smoothing factor (exponential smoothing)
+            tau = 1.0 / (2.0 * np.pi * cutoff)
+            alpha = dt / (dt + tau)
+            alpha = np.clip(alpha, 0.0, 1.0)
 
-def _interpolate_pose(
-    before: Dict,
-    after: Dict,
-    frame_before: int,
-    frame_after: int,
-    target_frame: int,
-    frame_shape: Tuple[int, int],
-) -> Dict:
-    """Interpolate a pose dict for target_frame given before & after poses."""
-    if frame_after == frame_before:
-        t = 0
-    else:
-        t = (target_frame - frame_before) / (frame_after - frame_before)
+            low_pass = low_pass + alpha * (signal[i] - low_pass)
+            out[i] = low_pass
+            self.prev_low = signal[i]
 
-    landmarks = {}
-    for name in before['landmarks']:
-        if name in before['landmarks'] and name in after['landmarks']:
-            landmarks[name] = _lerp(
-                before['landmarks'][name],
-                after['landmarks'][name],
-                t,
-            )
-        elif name in before['landmarks']:
-            landmarks[name] = _copy_landmark(before['landmarks'][name])
-        elif name in after['landmarks']:
-            landmarks[name] = _copy_landmark(after['landmarks'][name])
-
-    # Use frame_shape from before (or after) as fallback
-    return {
-        'landmarks': landmarks,
-        'raw_landmarks': None,  # No raw MediaPipe data — it's synthetic
-        'frame_shape': frame_shape,
-    }
+        return out
 
 
-# ── Main smoothing pipeline ──────────────────────────────────────────────
+class KalmanFilter1D:
+    """Simple 1D Kalman filter for smoothing a coordinate over time."""
+
+    def __init__(self, process_noise: float = KALMAN_PROCESS_NOISE,
+                 measurement_noise: float = KALMAN_MEASUREMENT_NOISE):
+        self.Q = process_noise  # Process noise covariance
+        self.R = measurement_noise  # Measurement noise covariance
+        self.x = None  # State estimate
+        self.P = 1.0   # Estimate error covariance
+        self.initialized = False
+
+    def apply(self, signal: np.ndarray) -> np.ndarray:
+        """Apply Kalman filter to a 1-D signal array."""
+        if len(signal) < 2:
+            return signal.copy()
+
+        out = np.empty_like(signal)
+
+        for i in range(len(signal)):
+            z = signal[i]  # Measurement
+            if not self.initialized:
+                self.x = z
+                self.P = 1.0
+                self.initialized = True
+                out[i] = z
+                continue
+
+            # Predict (assume constant velocity; we can extend later)
+            # For now, just predict same as previous
+            # State transition: x = x_prev (constant position model)
+            self.P += self.Q  # Update covariance
+
+            # Update (measurement)
+            K = self.P / (self.P + self.R)  # Kalman gain
+            self.x = self.x + K * (z - self.x)
+            self.P = (1 - K) * self.P
+
+            out[i] = self.x
+
+        return out
+
+
+# ── Main smoothing pipeline ──
 
 def smooth_pose_data(pose_data: List[Dict]) -> List[Dict]:
     """
-    Apply post-processing to improve pose data quality.
+    Apply advanced temporal smoothing to pose data.
+
+    Operates on the full time series, using non-causal filters.
+    Modifies pose_data in-place and returns it.
 
     Steps:
-      1. Forward-fill + backward-fill missing detections, then interpolate.
-      2. Detect implausible landmark proximities and reduce visibility.
-      3. Apply kinematic constraints — zero-out landmarks that move
-         impossibly fast between consecutive frames.
-      4. Re-interpolate any landmarks that were zeroed out in step 3.
+      1. Extract per-landmark time series for all coordinates.
+      2. Apply Savitzky–Golay to each coordinate time series.
+      3. Apply One Euro filter (non-causal variant) for adaptive smoothing.
+      4. Apply Kalman filter to torso landmarks.
+      5. Cubic-spline interpolation for short occlusion gaps.
+      6. Rebuild landmark dicts from filtered time series.
+      7. Recalculate visibility based on temporal consistency.
 
-    Modifies pose_data in-place and returns it.
+    Returns the modified pose_data list.
     """
     if not pose_data:
         return pose_data
 
-    print("\nSmoothing pose data...")
+    print("\n[Precision] Applying advanced temporal smoothing...")
+    print(f"  Savitzky–Golay: window={SG_WINDOW}, polyorder={SG_POLYORDER}")
+    print(f"  One Euro filter: beta={ONE_EURO_BETA}")
+    print(f"  Kalman filter on torso landmarks")
 
-    # ── Step 1: Interpolate missing frames ──
-    _interpolate_missing_frames(pose_data)
+    # ── Step 1: Extract time series per landmark ──
+    n_frames = len(pose_data)
+    landmarks_of_interest = [
+        'nose',
+        'left_shoulder', 'right_shoulder',
+        'left_elbow', 'right_elbow',
+        'left_wrist', 'right_wrist',
+        'left_hip', 'right_hip',
+        'left_knee', 'right_knee',
+        'left_ankle', 'right_ankle',
+    ]
 
-    # ── Step 2: Fix implausible proximities ──
-    _fix_implausible_proximities(pose_data)
+    # Build arrays: for each landmark, we have (x, y, z) time series
+    # We only smooth coordinates where visibility > 0.5 for most frames
+    time_series = {}
+    for lm in landmarks_of_interest:
+        xs = []
+        ys = []
+        zs = []
+        for fd in pose_data:
+            pose = fd.get('pose')
+            if pose is None:
+                xs.append(np.nan)
+                ys.append(np.nan)
+                zs.append(np.nan)
+            else:
+                l = pose['landmarks'].get(lm)
+                if l is None or l.get('visibility', 0) < 0.3:
+                    xs.append(np.nan)
+                    ys.append(np.nan)
+                    zs.append(np.nan)
+                else:
+                    xs.append(l['x'])
+                    ys.append(l['y'])
+                    zs.append(l.get('z', 0))
+        time_series[lm] = {
+            'x': np.array(xs, dtype=float),
+            'y': np.array(ys, dtype=float),
+            'z': np.array(zs, dtype=float),
+        }
 
-    # ── Step 3: Kinematic filtering ──
-    _apply_kinematic_filter(pose_data)
+    # ── Step 2: Savitzky–Golay smoothing ──
+    for lm in landmarks_of_interest:
+        for coord in ('x', 'y', 'z'):
+            sig = time_series[lm][coord]
+            # Count valid (non-NaN) entries
+            valid = ~np.isnan(sig)
+            if np.sum(valid) < SG_WINDOW:
+                continue
 
-    # ── Step 4: Re-interpolate landmarks that were zeroed ──
-    _reinterpolate_zeroed(pose_data)
+            # Linear interpolation to fill NaNs before filtering
+            filled = _fill_nan_linear(sig)
 
-    # Count how many frames now have valid pose
-    valid_count = sum(1 for fd in pose_data if fd['pose'] is not None)
-    print(f"Smoothing complete: {valid_count}/{len(pose_data)} frames have valid pose")
-    return pose_data
+            # Apply Savitzky–Golay
+            # Window must be odd and ≤ len(signal)
+            w = min(SG_WINDOW, len(filled))
+            if w % 2 == 0:
+                w -= 1
+            w = max(w, 3)  # Minimum window
+            try:
+                smoothed = savgol_filter(filled, w, SG_POLYORDER)
+                # Replace only valid positions; keep original NaNs elsewhere
+                smoothed[~valid] = np.nan
+                time_series[lm][coord] = smoothed
+            except Exception:
+                # Fall back to original if SavGol fails
+                pass
 
+    # ── Step 3: One Euro filter ──
+    # We apply a non-causal variant: forward One Euro, then backward.
+    # This gives us the low-latency adaptive behaviour while using
+    # non-causal smoothing (better for offline analysis).
+    for lm in landmarks_of_interest:
+        for coord in ('x', 'y', 'z'):
+            sig = time_series[lm][coord]
+            valid = ~np.isnan(sig)
+            if np.sum(valid) < 3:
+                continue
 
-# ── Step 1: Interpolate missing frames ──
+            # Forward-backward One Euro for zero-phase filtering
+            filled = _fill_nan_linear(sig)
 
-def _interpolate_missing_frames(pose_data: List[Dict]):
-    """Fill pose=None entries by interpolating from surrounding valid frames."""
-    n = len(pose_data)
-    if n < 2:
-        return
+            # Forward pass
+            oef = OneEuroFilter(beta=ONE_EURO_BETA)
+            forward = oef.apply(filled)
 
-    # First, forward-fill: find the first valid frame and fill backward
-    first_valid = None
-    for i in range(n):
-        if pose_data[i]['pose'] is not None:
-            first_valid = i
-            break
+            # Backward pass (reverse and apply again)
+            oef_b = OneEuroFilter(beta=ONE_EURO_BETA * 0.5)  # Less aggressive backward
+            backward = oef_b.apply(forward[::-1])
+            backward = backward[::-1]
 
-    if first_valid is not None:
-        # Fill frames before first valid with the first valid pose
-        for i in range(first_valid):
-            if pose_data[i]['pose'] is None:
-                pose_data[i]['pose'] = _copy_pose(pose_data[first_valid]['pose'])
+            # Average forward and backward (centred)
+            smoothed = (forward + backward) / 2
+            smoothed[~valid] = np.nan
+            time_series[lm][coord] = smoothed
 
-    # Forward-fill: propagate last valid pose forward
-    last_valid = None
-    for i in range(n):
-        if pose_data[i]['pose'] is not None:
-            last_valid = i
+    # ── Step 4: Kalman filter on torso landmarks ──
+    for lm in KALMAN_LANDMARKS:
+        for coord in ('x', 'y'):
+            sig = time_series[lm][coord]
+            valid = ~np.isnan(sig)
+            if np.sum(valid) < 5:
+                continue
 
-    if last_valid is not None:
-        for i in range(last_valid + 1, n):
-            if pose_data[i]['pose'] is None:
-                pose_data[i]['pose'] = _copy_pose(pose_data[last_valid]['pose'])
+            filled = _fill_nan_linear(sig)
+            kf = KalmanFilter1D()
+            smoothed = kf.apply(filled)
+            smoothed[~valid] = np.nan
+            time_series[lm][coord] = smoothed
 
-    # Now interpolate between valid frames
-    _interpolate_gaps(pose_data)
+    # ── Step 5: Cubic spline interpolation for short occlusion gaps ──
+    # After filtering, some gaps may have widened due to NaN handling.
+    # Use cubic interpolation for gaps ≤ MAX_SPLINE_GAP.
+    _spline_interpolate_gaps(time_series, landmarks_of_interest, pose_data)
 
-
-def _copy_pose(pose: Dict) -> Dict:
-    """Deep-copy a pose dict (landmarks only, no raw_landmarks)."""
-    if pose is None:
-        return None
-    landmarks = {}
-    for name, lm in pose.get('landmarks', {}).items():
-        landmarks[name] = _copy_landmark(lm)
-    return {
-        'landmarks': landmarks,
-        'raw_landmarks': None,
-        'frame_shape': pose.get('frame_shape', (0, 0)),
-    }
-
-
-def _interpolate_gaps(pose_data: List[Dict]):
-    """
-    For each gap between two valid frames, replace the copied pose
-    with a proper interpolation.
-    """
-    n = len(pose_data)
-    i = 0
-    while i < n:
-        if pose_data[i]['pose'] is not None:
-            # Find next valid frame
-            j = i + 1
-            while j < n and pose_data[j]['pose'] is None:
-                j += 1
-            if j < n and pose_data[j]['pose'] is not None:
-                # Gap from i+1 to j-1
-                before = pose_data[i]['pose']
-                after = pose_data[j]['pose']
-                frame_shape = before.get('frame_shape', after.get('frame_shape', (0, 0)))
-                for k in range(i + 1, j):
-                    interpolated = _interpolate_pose(
-                        before, after,
-                        pose_data[i]['frame_number'],
-                        pose_data[j]['frame_number'],
-                        pose_data[k]['frame_number'],
-                        frame_shape,
-                    )
-                    pose_data[k]['pose'] = interpolated
-            i = j
-        else:
-            i += 1
-
-
-# ── Step 2: Fix implausible proximities ──
-
-def _fix_implausible_proximities(pose_data: List[Dict]):
-    """Check landmark pairs that should never be close, reduce visibility if so."""
-    for frame_data in pose_data:
-        pose = frame_data.get('pose')
+    # ── Step 6: Rebuild landmark dicts from filtered time series ──
+    for i, fd in enumerate(pose_data):
+        pose = fd.get('pose')
         if pose is None:
             continue
         landmarks = pose.get('landmarks', {})
         if not landmarks:
             continue
 
-        for (a_name, b_name) in CLOSE_CHECK_PAIRS:
-            a = landmarks.get(a_name)
-            b = landmarks.get(b_name)
-            if a is None or b is None:
+        for lm in landmarks_of_interest:
+            if lm not in landmarks:
                 continue
-            if a.get('visibility', 0) < MIN_VISIBILITY or b.get('visibility', 0) < MIN_VISIBILITY:
-                continue
+            l = landmarks[lm]
+            for coord in ('x', 'y', 'z'):
+                val = time_series[lm][coord][i]
+                if not np.isnan(val):
+                    l[coord] = float(val)
 
-            dist = _euclidean(a, b)
-            if dist < MIN_LANDMARK_SEPARATION:
-                # One of them is likely a hallucination — drop visibility on the
-                # one with lower confidence, or the more distal one.
-                # Distal landmarks (wrist, ankle) are more likely to be wrong.
-                distal_weight = {'wrist': 2, 'ankle': 2, 'elbow': 1, 'knee': 1,
-                                 'shoulder': 0, 'hip': 0}
-                a_distal = max(distal_weight.get(a_name.split('_')[-1], 0), 0)
-                b_distal = max(distal_weight.get(b_name.split('_')[-1], 0), 0)
-                a_vis = a.get('visibility', 0)
-                b_vis = b.get('visibility', 0)
-                # Zero the one that is less confident OR more distal
-                if a_distal > b_distal or (a_distal == b_distal and a_vis <= b_vis):
-                    a['visibility'] = 0.0
-                else:
-                    b['visibility'] = 0.0
+    # ── Step 7: Update visibility based on temporal consistency ──
+    _update_visibility_from_temporal_consistency(pose_data, landmarks_of_interest)
+
+    # Count valid frames
+    valid_count = sum(1 for fd in pose_data if fd['pose'] is not None)
+    print(f"  Smoothing complete: {valid_count}/{len(pose_data)} frames with valid pose")
+    return pose_data
 
 
-# ── Step 3: Kinematic filter ──
+# ── Helper functions ──
 
-def _apply_kinematic_filter(pose_data: List[Dict]):
-    """
-    For each consecutive pair of frames, check landmark movement deltas.
-    If any landmark moves more than MAX_PIXEL_DELTA_PER_FRAME, set its
-    visibility to 0 (it will be re-interpolated later).
-    """
-    n = len(pose_data)
+def _fill_nan_linear(arr: np.ndarray) -> np.ndarray:
+    """Fill NaN values with linear interpolation."""
+    out = arr.copy()
+    n = len(out)
     if n < 2:
-        return
+        return out
 
-    for i in range(1, n):
-        prev = pose_data[i - 1]
-        curr = pose_data[i]
+    # Find NaN positions
+    nan_mask = np.isnan(out)
 
-        if prev['pose'] is None or curr['pose'] is None:
-            continue
+    # Forward fill
+    last_valid = None
+    for i in range(n):
+        if not nan_mask[i]:
+            last_valid = out[i]
+        elif last_valid is not None:
+            out[i] = last_valid
 
-        prev_landmarks = prev['pose'].get('landmarks', {})
-        curr_landmarks = curr['pose'].get('landmarks', {})
+    # Backward fill (for leading NaNs)
+    last_valid = None
+    for i in range(n - 1, -1, -1):
+        if not nan_mask[i]:
+            last_valid = out[i]
+        elif last_valid is not None:
+            out[i] = last_valid
 
-        if not prev_landmarks or not curr_landmarks:
-            continue
+    # Now linearly interpolate between valid endpoints
+    # Find segments between non-NaN values
+    i = 0
+    while i < n:
+        if not np.isnan(out[i]):
+            # Find next valid
+            j = i + 1
+            while j < n and np.isnan(out[j]):
+                j += 1
+            if j < n:
+                # Interpolate between i and j
+                start_val = out[i]
+                end_val = out[j]
+                gap = j - i
+                for k in range(i + 1, j):
+                    t = (k - i) / gap
+                    out[k] = start_val + t * (end_val - start_val)
+            i = j
+        else:
+            i += 1
 
-        for name, curr_lm in curr_landmarks.items():
-            if curr_lm.get('visibility', 0) < MIN_VISIBILITY:
-                continue
-            prev_lm = prev_landmarks.get(name)
-            if prev_lm is None or prev_lm.get('visibility', 0) < MIN_VISIBILITY:
-                continue
-
-            # Pixel distance moved
-            dx = curr_lm['x'] - prev_lm['x']
-            dy = curr_lm['y'] - prev_lm['y']
-            dist = float(np.sqrt(dx * dx + dy * dy))
-
-            if dist > MAX_PIXEL_DELTA_PER_FRAME:
-                curr_lm['visibility'] = 0.0
-
-        # Also check angle changes for elbow and knee
-        # Map joint name to the three landmark names (proximal, joint, distal)
-        joint_landmark_map = {
-            'elbow': ('shoulder', 'elbow', 'wrist'),
-            'knee': ('hip', 'knee', 'ankle'),
-        }
-        for side in ('left', 'right'):
-            for joint, (prox, jnt, dist) in joint_landmark_map.items():
-                p1 = f'{side}_{prox}'
-                p2 = f'{side}_{jnt}'
-                p3 = f'{side}_{dist}'
-                if p1 in curr_landmarks and p2 in curr_landmarks and p3 in curr_landmarks:
-                    curr_angle = _calculate_angle(curr_landmarks[p1], curr_landmarks[p2], curr_landmarks[p3])
-                    prev_angle = _calculate_angle(
-                        prev_landmarks.get(p1, {}),
-                        prev_landmarks.get(p2, {}),
-                        prev_landmarks.get(p3, {}),
-                    )
-                    if curr_angle is not None and prev_angle is not None:
-                        delta = abs(curr_angle - prev_angle)
-                        if delta > MAX_ANGLE_DELTA_PER_FRAME:
-                            curr_landmarks[p2]['visibility'] = 0.0
+    return out
 
 
-# ── Step 4: Re-interpolate zeroed landmarks ──
-
-def _reinterpolate_zeroed(pose_data: List[Dict]):
+def _spline_interpolate_gaps(time_series: Dict, landmarks: List[str],
+                              pose_data: List[Dict]):
     """
-    After kinematic filtering, some landmarks have visibility=0.
-    Re-interpolate them from surrounding frames with valid visibility.
+    Replace linear interpolation with cubic spline for gaps ≤ MAX_SPLINE_GAP.
+    """
+    from scipy.interpolate import CubicSpline  # lazy import
+
+    n = len(pose_data)
+    for lm in landmarks:
+        for coord in ('x', 'y', 'z'):
+            sig = time_series[lm][coord]
+            valid = ~np.isnan(sig)
+            valid_indices = np.where(valid)[0]
+
+            if len(valid_indices) < 4:
+                continue
+
+            # Build cubic spline from valid points
+            try:
+                cs = CubicSpline(valid_indices, sig[valid_indices], axis=0,
+                                 bc_type='natural')
+            except Exception:
+                continue
+
+            # Evaluate at all indices, but only replace short gaps
+            full = cs(np.arange(n))
+
+            # Find NaN gaps in original
+            nan_start = None
+            for i in range(n):
+                if np.isnan(sig[i]):
+                    if nan_start is None:
+                        nan_start = i
+                elif nan_start is not None:
+                    gap_len = i - nan_start
+                    if gap_len <= MAX_SPLINE_GAP:
+                        # Replace with spline values
+                        for j in range(nan_start, i):
+                            sig[j] = full[j]
+                    nan_start = None
+            if nan_start is not None:
+                gap_len = n - nan_start
+                if gap_len <= MAX_SPLINE_GAP:
+                    for j in range(nan_start, n):
+                        sig[j] = full[j]
+
+
+def _update_visibility_from_temporal_consistency(
+    pose_data: List[Dict],
+    landmarks: List[str],
+    max_std: float = 15.0  # Max std of pixel movement over 5-frame window
+):
+    """
+    Down-weight visibility on landmarks whose temporal trajectory is
+    suspiciously jittery (indicating a pose-estimation glitch rather than
+    genuine movement).
     """
     n = len(pose_data)
-    if n < 3:
+    if n < 5:
         return
 
-    # For each frame, check each landmark
-    for i in range(n):
-        frame_data = pose_data[i]
-        if frame_data['pose'] is None:
-            continue
-        landmarks = frame_data['pose'].get('landmarks', {})
-        if not landmarks:
-            continue
+    for lm in landmarks:
+        xs = []
+        for fd in pose_data:
+            pose = fd.get('pose')
+            if pose is None:
+                xs.append(np.nan)
+            else:
+                l = pose['landmarks'].get(lm)
+                if l is None:
+                    xs.append(np.nan)
+                else:
+                    xs.append(l.get('x', np.nan))
 
-        for name, lm in landmarks.items():
-            if lm['visibility'] > 0:
-                continue  # Already valid
+        xs_arr = np.array(xs, dtype=float)
 
-            # Find nearest valid before and after
-            before_idx, after_idx = None, None
-            for j in range(i - 1, -1, -1):
-                if pose_data[j]['pose'] is not None:
-                    prev_lm = pose_data[j]['pose']['landmarks'].get(name)
-                    if prev_lm and prev_lm['visibility'] > MIN_VISIBILITY:
-                        before_idx = j
-                        break
-            for j in range(i + 1, n):
-                if pose_data[j]['pose'] is not None:
-                    next_lm = pose_data[j]['pose']['landmarks'].get(name)
-                    if next_lm and next_lm['visibility'] > MIN_VISIBILITY:
-                        after_idx = j
-                        break
-
-            if before_idx is not None and after_idx is not None:
-                before = pose_data[before_idx]['pose']['landmarks'][name]
-                after = pose_data[after_idx]['pose']['landmarks'][name]
-                t = (pose_data[i]['frame_number'] - pose_data[before_idx]['frame_number']) / \
-                    (pose_data[after_idx]['frame_number'] - pose_data[before_idx]['frame_number'] + 1e-6)
-                interpolated = _lerp(before, after, t)
-                lm['x'] = interpolated['x']
-                lm['y'] = interpolated['y']
-                lm['z'] = interpolated['z']
-                lm['visibility'] = interpolated['visibility']
-            elif before_idx is not None:
-                # Forward-fill from before
-                before = pose_data[before_idx]['pose']['landmarks'][name]
-                lm['x'] = before['x']
-                lm['y'] = before['y']
-                lm['z'] = before.get('z', 0)
-                lm['visibility'] = before.get('visibility', 0) * 0.5
-            elif after_idx is not None:
-                # Backward-fill from after
-                after = pose_data[after_idx]['pose']['landmarks'][name]
-                lm['x'] = after['x']
-                lm['y'] = after['y']
-                lm['z'] = after.get('z', 0)
-                lm['visibility'] = after.get('visibility', 0) * 0.5
-
-
-# ── Angle calculation (same as pose_detector) ──
-
-def _calculate_angle(p1: Dict, p2: Dict, p3: Dict) -> Optional[float]:
-    """Angle at p2 in degrees."""
-    if not all(k in p1 and k in p2 and k in p3 for k in ('x', 'y')):
-        return None
-    a = np.array([p1['x'], p1['y']])
-    b = np.array([p2['x'], p2['y']])
-    c = np.array([p3['x'], p3['y']])
-    v1 = a - b
-    v2 = c - b
-    norm = np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6
-    cos = np.dot(v1, v2) / norm
-    cos = np.clip(cos, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cos)))
+        # Compute local std over 5-frame windows
+        for i in range(2, n - 2):
+            window = xs_arr[i - 2:i + 3]
+            valid = window[~np.isnan(window)]
+            if len(valid) < 3:
+                continue
+            local_std = np.std(valid)
+            if local_std > max_std:
+                # Mark this frame's landmark as low-visibility
+                fd = pose_data[i]
+                if fd['pose'] is not None:
+                    l = fd['pose']['landmarks'].get(lm)
+                    if l is not None:
+                        # Reduce visibility proportionally
+                        current_vis = l.get('visibility', 0.5)
+                        penalty = min(1.0, local_std / max_std)
+                        l['visibility'] = max(0.0, current_vis * (1.0 - penalty * 0.5))

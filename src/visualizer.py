@@ -32,6 +32,32 @@ class Visualizer:
         # Persistent color for elbow-diff line (keeps last state when no data)
         self._last_elbow_diff_color = (255, 255, 255)  # white fallback
 
+        # ── Swimming-relevant skeleton connections (filtered from full MediaPipe) ──
+        # Only draw connections between landmarks that are useful for stroke analysis.
+        # This avoids garbage lines from face/hands/feet landmarks that are
+        # underwater or incorrectly detected.
+        self._swim_connections = [
+            # Torso
+            (11, 12),   # left_shoulder ↔ right_shoulder
+            (11, 23),   # left_shoulder ↔ left_hip
+            (12, 24),   # right_shoulder ↔ right_hip
+            (23, 24),   # left_hip ↔ right_hip
+            # Left arm
+            (11, 13),   # left_shoulder ↔ left_elbow
+            (13, 15),   # left_elbow ↔ left_wrist
+            # Right arm
+            (12, 14),   # right_shoulder ↔ right_elbow
+            (14, 16),   # right_elbow ↔ right_wrist
+            # Left leg
+            (23, 25),   # left_hip ↔ left_knee
+            (25, 27),   # left_knee ↔ left_ankle
+            # Right leg
+            (24, 26),   # right_hip ↔ right_knee
+            (26, 28),   # right_knee ↔ right_ankle
+        ]
+        # Landmark indices that are relevant (swimming subset)
+        self._swim_landmark_indices = {11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28}
+
     def create_annotated_video(
         self,
         pose_data: List[Dict],
@@ -119,14 +145,23 @@ class Visualizer:
     def _draw_pose(self, frame: np.ndarray, pose: Dict) -> np.ndarray:
         """Draw pose skeleton on frame.
 
+        Uses a filtered set of swimming-relevant connections (shoulders, arms,
+        hips, legs) with visibility thresholds.  Avoids garbage lines from
+        face/hands/feet landmarks that are underwater or incorrectly detected.
+
+        When MediaPipe raw_landmarks are available (standard mode), uses the
+        native MediaPipe drawing for the full skeleton.  When unavailable
+        (precision/fusion mode), draws from the landmarks dict directly.
+
         For butterfly, both arms are highlighted with a different colour to
         emphasise simultaneous motion.  An entry-width line is drawn between
         the two wrists when both are visible.
         """
         landmarks = pose.get('landmarks', {})
+        VIS_THRESH = 0.3  # minimum visibility (lowered to accommodate precision-mode penalties)
 
-        # Draw the full MediaPipe skeleton
-        if pose['raw_landmarks'] is not None:
+        # ── Native MediaPipe skeleton (standard mode) ──
+        if pose.get('raw_landmarks') is not None:
             self.mp_drawing.draw_landmarks(
                 frame,
                 pose['raw_landmarks'],
@@ -141,6 +176,37 @@ class Visualizer:
                     thickness=2
                 )
             )
+        else:
+            # ── Precision mode: draw filtered skeleton from landmarks dict ──
+            name_to_idx = {
+                'nose': 0,
+                'left_shoulder': 11, 'right_shoulder': 12,
+                'left_elbow': 13, 'right_elbow': 14,
+                'left_wrist': 15, 'right_wrist': 16,
+                'left_hip': 23, 'right_hip': 24,
+                'left_knee': 25, 'right_knee': 26,
+                'left_ankle': 27, 'right_ankle': 28,
+            }
+            # Draw connections
+            for (src_idx, dst_idx) in self._swim_connections:
+                src_name = next((k for k, v in name_to_idx.items() if v == src_idx), None)
+                dst_name = next((k for k, v in name_to_idx.items() if v == dst_idx), None)
+                if src_name is None or dst_name is None:
+                    continue
+                src_lm = landmarks.get(src_name)
+                dst_lm = landmarks.get(dst_name)
+                if (src_lm is not None and dst_lm is not None and
+                    src_lm.get('visibility', 0) >= VIS_THRESH and
+                    dst_lm.get('visibility', 0) >= VIS_THRESH):
+                    x1, y1 = int(src_lm['x']), int(src_lm['y'])
+                    x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
+                    cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_SKELETON, 2)
+            # Draw landmark dots
+            for name in name_to_idx:
+                lm = landmarks.get(name)
+                if lm and lm.get('visibility', 0) >= VIS_THRESH:
+                    x, y = int(lm['x']), int(lm['y'])
+                    cv2.circle(frame, (x, y), 4, self.COLOR_SKELETON, -1)
 
         # ── Butterfly-specific overlays ──
         if not self._is_butterfly:
@@ -157,8 +223,8 @@ class Visualizer:
             src_lm = landmarks.get(src)
             dst_lm = landmarks.get(dst)
             if (src_lm and dst_lm and
-                src_lm.get('visibility', 0) > 0.5 and
-                dst_lm.get('visibility', 0) > 0.5):
+                src_lm.get('visibility', 0) > 0.3 and
+                dst_lm.get('visibility', 0) > 0.3):
                 x1, y1 = int(src_lm['x']), int(src_lm['y'])
                 x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
                 cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_BOTH_ARMS, 4)
@@ -169,8 +235,8 @@ class Visualizer:
         left_wrist = landmarks.get('left_wrist')
         right_wrist = landmarks.get('right_wrist')
         if (left_wrist and right_wrist and
-            left_wrist.get('visibility', 0) > 0.5 and
-            right_wrist.get('visibility', 0) > 0.5):
+            left_wrist.get('visibility', 0) > 0.3 and
+            right_wrist.get('visibility', 0) > 0.3):
             lx = int(left_wrist['x'])
             ly = int(left_wrist['y'])
             rx = int(right_wrist['x'])
@@ -182,9 +248,9 @@ class Visualizer:
         right_hip = landmarks.get('right_hip')
 
         hip_x, hip_y = None, None
-        if left_hip and left_hip.get('visibility', 0) > 0.5:
+        if left_hip and left_hip.get('visibility', 0) > 0.3:
             hip_x, hip_y = int(left_hip['x']), int(left_hip['y'])
-        elif right_hip and right_hip.get('visibility', 0) > 0.5:
+        elif right_hip and right_hip.get('visibility', 0) > 0.3:
             hip_x, hip_y = int(right_hip['x']), int(right_hip['y'])
 
         if hip_x is not None:
@@ -319,7 +385,7 @@ class Visualizer:
             left_wr.get('visibility', 0) > 0.5):
             live_angle = self._calculate_angle(left_sh, left_el, left_wr)
             color = self._get_angle_color(live_angle, elbow_opt_min, elbow_opt_max, elbow_crit, reverse=False)
-            lines.append((f"Elbow: {live_angle:.0f}deg", color, 0.5, 1))
+            lines.append((f"Elbow(3D): {live_angle:.0f}deg", color, 0.5, 1))
         else:
             lines.append(("Elbow: ---", self.COLOR_TEXT, 0.5, 1))
 
@@ -545,11 +611,21 @@ class Visualizer:
                 return self.COLOR_MODERATE
 
     @staticmethod
-    def _calculate_angle(point1: Dict, point2: Dict, point3: Dict) -> float:
-        """Calculate angle between three points."""
-        p1 = np.array([point1['x'], point1['y']])
-        p2 = np.array([point2['x'], point2['y']])
-        p3 = np.array([point3['x'], point3['y']])
+    def _calculate_angle(point1: Dict, point2: Dict, point3: Dict, use_3d: bool = True) -> float:
+        """Calculate angle between three points, optionally in 3D.
+
+        When use_3d=True (default), uses (x, y, z) to compute the true 3D joint
+        angle.  This accounts for foreshortening and body roll — critical for
+        swimming where arms move toward/away from the camera.
+        """
+        if use_3d:
+            p1 = np.array([point1.get('x', 0), point1.get('y', 0), point1.get('z', 0)])
+            p2 = np.array([point2.get('x', 0), point2.get('y', 0), point2.get('z', 0)])
+            p3 = np.array([point3.get('x', 0), point3.get('y', 0), point3.get('z', 0)])
+        else:
+            p1 = np.array([point1['x'], point1['y']])
+            p2 = np.array([point2['x'], point2['y']])
+            p3 = np.array([point3['x'], point3['y']])
 
         v1 = p1 - p2
         v2 = p3 - p2

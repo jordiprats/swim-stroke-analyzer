@@ -1254,11 +1254,20 @@ class ButterflyAnalyzer:
         return active
 
     @staticmethod
-    def _calculate_angle(point1: Dict, point2: Dict, point3: Dict) -> float:
-        """Calculate angle between three points."""
-        p1 = np.array([point1['x'], point1['y']])
-        p2 = np.array([point2['x'], point2['y']])
-        p3 = np.array([point3['x'], point3['y']])
+    def _calculate_angle(point1: Dict, point2: Dict, point3: Dict, use_3d: bool = True) -> float:
+        """Calculate angle between three points, optionally in 3D.
+
+        Uses (x, y, z) as a 3D vector by default, accounting for foreshortening
+        and body roll. Falls back to 2D (x, y) when use_3d=False.
+        """
+        if use_3d:
+            p1 = np.array([point1.get('x', 0), point1.get('y', 0), point1.get('z', 0)])
+            p2 = np.array([point2.get('x', 0), point2.get('y', 0), point2.get('z', 0)])
+            p3 = np.array([point3.get('x', 0), point3.get('y', 0), point3.get('z', 0)])
+        else:
+            p1 = np.array([point1['x'], point1['y']])
+            p2 = np.array([point2['x'], point2['y']])
+            p3 = np.array([point3['x'], point3['y']])
 
         v1 = p1 - p2
         v2 = p3 - p2
